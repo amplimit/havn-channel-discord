@@ -55,6 +55,14 @@ fn silent() -> AllowedMentions {
     AllowedMentions::default()
 }
 
+/// Whether Discord refused a request as malformed (400).
+fn bad_request(e: &twilight_http::Error) -> bool {
+    matches!(
+        e.kind(),
+        twilight_http::error::ErrorType::Response { status, .. } if status.get() == 400
+    )
+}
+
 /// Discord's error code of a failed request, if it gave one.
 pub fn api_code(e: &twilight_http::Error) -> Option<u64> {
     match e.kind() {
@@ -136,10 +144,30 @@ impl Discord {
             {
                 request = request.reply(reply).fail_if_not_exists(false);
             }
-            if n == last && !components.is_empty() {
+            let with_components = n == last && !components.is_empty();
+            if with_components {
                 request = request.components(components);
             }
-            if let Err(e) = request.await {
+            let mut sent = request.await;
+            // Components Discord refuses (400) do not take the text with them.
+            if with_components
+                && let Err(e) = &sent
+                && bad_request(e)
+            {
+                tracing::warn!(error = %e, "discord refused the buttons; sending the text alone");
+                let mut again = self
+                    .http
+                    .create_message(channel)
+                    .content(part)
+                    .allowed_mentions(Some(&mentions));
+                if n == 0
+                    && let Some(reply) = reply
+                {
+                    again = again.reply(reply).fail_if_not_exists(false);
+                }
+                sent = again.await;
+            }
+            if let Err(e) = sent {
                 if n == 0 {
                     return Err(e).context("sending a message");
                 }
@@ -221,9 +249,12 @@ impl Discord {
 
     /// Set the bot's slash commands to the gateway's `commands`: how many.
     pub async fn set_commands(&self, commands: &[ChannelCommand]) -> Result<usize> {
+        // A name twice fails the whole list: the first is kept.
+        let mut seen = std::collections::HashSet::new();
         let list: Vec<Command> = commands
             .iter()
             .filter_map(slash_command)
+            .filter(|c| seen.insert(c.name.clone()))
             .take(100)
             .collect();
         self.http
@@ -252,13 +283,7 @@ impl Discord {
     /// The bytes of an attachment at `url`, from Discord's file hosts
     /// only, at most `max` of them.
     pub async fn download(&self, url: &str, max: usize) -> Result<Vec<u8>> {
-        let parsed = url::Url::parse(url).context("an attachment URL")?;
-        let host = parsed.host_str().unwrap_or_default();
-        if parsed.scheme() != "https"
-            || !matches!(host, "cdn.discordapp.com" | "media.discordapp.net")
-        {
-            bail!("not one of Discord's file hosts: {host}");
-        }
+        let parsed = file_host_url(url)?;
         let mut resp = self
             .cdn
             .get(parsed)
@@ -277,6 +302,17 @@ impl Discord {
         }
         Ok(bytes)
     }
+}
+
+/// `url` when it is on one of Discord's file hosts, over https.
+fn file_host_url(url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(url).context("an attachment URL")?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() != "https" || !matches!(host, "cdn.discordapp.com" | "media.discordapp.net")
+    {
+        bail!("not one of Discord's file hosts: {host}");
+    }
+    Ok(parsed)
 }
 
 /// The slash command for a gateway command, or `None` for a name Discord
@@ -320,7 +356,7 @@ fn slash_command(c: &ChannelCommand) -> Option<Command> {
             description: "What follows the command".into(),
             description_localizations: None,
             kind: CommandOptionType::String,
-            max_length: None,
+            max_length: Some(1900),
             max_value: None,
             min_length: None,
             min_value: None,
@@ -362,6 +398,22 @@ mod tests {
         );
         for bad in ["", "Model", "a b", &"x".repeat(33), "café"] {
             assert!(slash_command(&c(bad, "d")).is_none(), "{bad}");
+        }
+        assert_eq!(made.options[0].max_length, Some(1900));
+    }
+
+    #[test]
+    fn files_come_only_from_discords_hosts_over_https() {
+        assert!(file_host_url("https://cdn.discordapp.com/attachments/1/2/a.png").is_ok());
+        assert!(file_host_url("https://media.discordapp.net/x").is_ok());
+        for bad in [
+            "http://cdn.discordapp.com/a",
+            "https://cdn.discordapp.com.evil.example/a",
+            "https://evil.example/cdn.discordapp.com",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(file_host_url(bad).is_err(), "{bad}");
         }
     }
 }

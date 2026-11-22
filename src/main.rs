@@ -46,6 +46,7 @@ use twilight_model::channel::message::component::{
 };
 use twilight_model::channel::message::{AllowedMentions, Message, MessageFlags, MessageType};
 use twilight_model::channel::{Channel, ChannelType};
+use twilight_model::gateway::payload::incoming::MessageCreate;
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
@@ -172,18 +173,23 @@ async fn main() -> Result<()> {
         account_id: cfg.account_id.clone(),
         to_havn: outbound_tx.clone(),
         seq: Arc::new(AtomicU64::new(0)),
+        workers: Workers::default(),
     };
     let inbound_task = tokio::spawn(discord_inbound_loop(shard, ctx));
     let outbound_task = tokio::spawn(havn_outbound_loop(
         dc, gateway, inbound_rx, typing, delivered,
     ));
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("received Ctrl-C, shutting down"),
-        r = inbound_task => warn!(result = ?r, "discord inbound loop exited"),
-        r = outbound_task => warn!(result = ?r, "havn outbound loop exited unexpectedly"),
-    }
+    // A loop that ends is an error, so systemd restarts the daemon.
+    let ended = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("received Ctrl-C, shutting down");
+            Ok(())
+        }
+        r = inbound_task => Err(anyhow::anyhow!("the Discord connection ended: {r:?}")),
+        r = outbound_task => Err(anyhow::anyhow!("the havn outbound loop ended: {r:?}")),
+    };
     drop(outbound_tx);
-    Ok(())
+    ended
 }
 
 /// Who the bot is, and whether it may read every message ([`SEES_ALL`]);
@@ -249,7 +255,78 @@ struct Ctx {
     account_id: String,
     to_havn: tokio::sync::mpsc::Sender<ChannelFrame>,
     seq: Arc<AtomicU64>,
+    workers: Workers,
 }
+
+/// A worker for each channel with messages to pass on, so a channel's
+/// messages go on in order while one's file does not hold up another's.
+#[derive(Clone, Default)]
+struct Workers(Arc<Mutex<HashMap<Id<ChannelMarker>, Queue>>>);
+
+type Queue = tokio::sync::mpsc::UnboundedSender<Box<MessageCreate>>;
+
+/// A worker with nothing to do for this long ends.
+const WORKER_IDLE: Duration = Duration::from_secs(300);
+
+impl Workers {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id<ChannelMarker>, Queue>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `message` to its channel's worker, started when there is none (or
+    /// the one there just ended).
+    fn pass(&self, ctx: &Ctx, mut message: Box<MessageCreate>) {
+        let channel = message.channel_id;
+        loop {
+            let queue = self
+                .lock()
+                .entry(channel)
+                .or_insert_with(|| self.start(ctx, channel))
+                .clone();
+            match queue.send(message) {
+                Ok(()) => return,
+                Err(back) => {
+                    message = back.0;
+                    let mut workers = self.lock();
+                    if workers
+                        .get(&channel)
+                        .is_some_and(|q| q.same_channel(&queue))
+                    {
+                        workers.remove(&channel);
+                    }
+                }
+            }
+        }
+    }
+
+    fn start(&self, ctx: &Ctx, channel: Id<ChannelMarker>) -> Queue {
+        let (queue, mut messages) = tokio::sync::mpsc::unbounded_channel::<Box<MessageCreate>>();
+        let ctx = ctx.clone();
+        let workers = self.clone();
+        let own = queue.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(message)) = tokio::time::timeout(WORKER_IDLE, messages.recv()).await {
+                on_message(&ctx, &message).await;
+            }
+            // What came as it ended goes on; what comes after finds it
+            // closed, and starts another.
+            messages.close();
+            while let Ok(message) = messages.try_recv() {
+                on_message(&ctx, &message).await;
+            }
+            let mut all = workers.lock();
+            if all.get(&channel).is_some_and(|q| q.same_channel(&own)) {
+                all.remove(&channel);
+            }
+        });
+        queue
+    }
+}
+
+/// Files fetched from Discord and given to the gateway at once, at most.
+static TRANSFERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// Discord to havn: every event updates the cache; messages and
 /// interactions go on. The shard reconnects and resumes on its own; it
@@ -276,19 +353,23 @@ async fn discord_inbound_loop(mut shard: Shard, ctx: Ctx) -> Result<()> {
         let event = match item {
             Ok(event) => event,
             Err(e) => {
-                warn!(error = %e, "discord gateway: could not read an event");
+                // An event not read is not shown: it may hold a message or an
+                // interaction's token.
+                if matches!(
+                    e.kind(),
+                    twilight_gateway::error::ReceiveMessageErrorType::Deserializing { .. }
+                ) {
+                    warn!("discord gateway: an event could not be read");
+                } else {
+                    warn!(error = %e, "discord gateway: could not read an event");
+                }
                 continue;
             }
         };
         ctx.cache.update(&event);
         match event {
             Event::Ready(ready) => info!(guilds = ready.guilds.len(), "discord gateway ready"),
-            Event::MessageCreate(m) => {
-                let ctx = ctx.clone();
-                // A file to fetch does not hold up the next message; the
-                // order of one sender's messages is kept by Discord's pace.
-                tokio::spawn(async move { on_message(&ctx, &m).await });
-            }
+            Event::MessageCreate(m) => ctx.workers.pass(&ctx, m),
             Event::InteractionCreate(i) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move { on_interaction(&ctx, &i).await });
@@ -307,8 +388,20 @@ struct Place {
     /// The channel: the thread's parent, or where it was written.
     channel: Id<ChannelMarker>,
     channel_name: Option<String>,
+    /// The channel's kind, when known: threads open from messages only in
+    /// some.
+    channel_kind: Option<ChannelType>,
     /// The thread it was written in, if any.
     thread: Option<Thread>,
+}
+
+/// Whether a thread can be opened from a message in a channel of `kind`:
+/// a text or an announcement channel's (not a voice channel's chat).
+fn opens_threads(kind: Option<ChannelType>) -> bool {
+    matches!(
+        kind,
+        Some(ChannelType::GuildText | ChannelType::GuildAnnouncement)
+    )
 }
 
 /// A thread a message was written in.
@@ -351,6 +444,7 @@ async fn place_of(ctx: &Ctx, guild: Id<GuildMarker>, id: Id<ChannelMarker>) -> O
             guild,
             guild_name,
             channel: parent_id,
+            channel_kind: parent.as_ref().map(|p| p.kind),
             channel_name: parent.and_then(|p| p.name),
             thread: Some(Thread {
                 id: here.id,
@@ -363,6 +457,7 @@ async fn place_of(ctx: &Ctx, guild: Id<GuildMarker>, id: Id<ChannelMarker>) -> O
             guild,
             guild_name,
             channel: here.id,
+            channel_kind: Some(here.kind),
             channel_name: here.name,
             thread: None,
         })
@@ -510,6 +605,24 @@ fn mentions_bot(ctx: &Ctx, message: &Message) -> bool {
             .is_some_and(|replied| replied.author.id == me)
 }
 
+/// `message`'s text without the mentions of the bot (and its role).
+fn without_bot(ctx: &Ctx, message: &Message) -> String {
+    let mut content = message
+        .content
+        .replace(&format!("<@{}>", ctx.dc.me), "")
+        .replace(&format!("<@!{}>", ctx.dc.me), "");
+    for role in &message.mention_roles {
+        let bots = ctx
+            .cache
+            .role(*role)
+            .is_some_and(|r| r.resource().tags.as_ref().and_then(|t| t.bot_id) == Some(ctx.dc.me));
+        if bots {
+            content = content.replace(&format!("<@&{role}>"), "");
+        }
+    }
+    content
+}
+
 /// The names of what `message` refers to by id.
 fn names_in(ctx: &Ctx, message: &Message) -> text::Names {
     let mut names = text::Names::default();
@@ -639,9 +752,13 @@ async fn server_group(
     let addressed = in_own_thread || mentions_bot(ctx, message);
     let thread = if place.thread.is_some() {
         thread_of(&place)
-    } else if addressed {
-        // A mention in a channel starts a conversation of its own.
-        let name = text::thread_name(&text::readable(&message.content, &names_in(ctx, message)));
+    } else if addressed && opens_threads(place.channel_kind) {
+        // A mention in a channel starts a conversation of its own, named
+        // from it without the bot's mention.
+        let name = text::thread_name(&text::readable(
+            &without_bot(ctx, message),
+            &names_in(ctx, message),
+        ));
         let id: Id<ChannelMarker> = message.id.cast();
         if let Ok(mut waiting) = WAITING_THREADS.lock() {
             waiting.put(id.get(), (place.channel, name.clone()));
@@ -731,6 +848,8 @@ async fn on_message(ctx: &Ctx, message: &Message) {
         );
     }
     let attachments = message_files(ctx, &sender, group.as_ref(), message, &mut said).await;
+    let said_trimmed = said.trim_start().len();
+    said.replace_range(..said.len() - said_trimmed, "");
     let lines = context_lines(ctx, message);
     if !lines.is_empty() {
         said = if said.is_empty() {
@@ -772,6 +891,10 @@ async fn receive(
     if usize::try_from(file.size).unwrap_or(usize::MAX) > gateway::MAX_FILE_BYTES {
         anyhow::bail!("larger than {} MB", gateway::MAX_FILE_BYTES / (1024 * 1024));
     }
+    let _turn = TRANSFERS
+        .acquire()
+        .await
+        .context("file transfers stopped")?;
     let bytes = ctx.dc.download(&file.url, gateway::MAX_FILE_BYTES).await?;
     let media_type = file
         .content_type
@@ -812,13 +935,18 @@ async fn send_inbound(
     }
 }
 
-/// What a slash command, a button pressed or a choice made says, and how
-/// Discord is answered; `None` for another interaction, or a choice in a
-/// question no longer open (then answered so).
-async fn interaction_said(
-    ctx: &Ctx,
-    interaction: &Interaction,
-) -> Option<(String, InteractionResponse)> {
+/// What an interaction asks for.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    /// Text to pass on as typed.
+    Said(String),
+    /// A choice in a question kept by number: its answer, then `numbers`.
+    Numbered { menu: u64, numbers: String },
+}
+
+/// What a slash command, a button pressed or a choice made asks, and how
+/// Discord is answered; `None` for another interaction.
+fn parse_interaction(interaction: &Interaction) -> Option<(Asked, InteractionResponse)> {
     use twilight_model::application::interaction::application_command::CommandOptionValue;
     match (&interaction.kind, &interaction.data) {
         (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data))) => {
@@ -836,9 +964,10 @@ async fn interaction_said(
                 None => format!("/{}", data.name),
             };
             // What was asked shows in the chat, as a typed command would.
-            let shown = format!("`{}`", said.replace('`', "'"));
+            let mut shown: String = said.replace('`', "'").chars().take(1900).collect();
+            shown = format!("`{shown}`");
             Some((
-                said,
+                Asked::Said(said),
                 InteractionResponse {
                     kind: InteractionResponseType::ChannelMessageWithSource,
                     data: Some(InteractionResponseData {
@@ -850,32 +979,27 @@ async fn interaction_said(
             ))
         }
         (InteractionType::MessageComponent, Some(InteractionData::MessageComponent(data))) => {
-            let said = if let Some(menu) = data.custom_id.strip_prefix(MENU_PREFIX) {
-                let Some(answer) = MENUS
-                    .lock()
-                    .ok()
-                    .and_then(|mut m| m.take(menu.parse().unwrap_or(0)))
-                else {
-                    let closed = ephemeral("This question is no longer open.");
-                    let _ = ctx
-                        .dc
-                        .respond(interaction.id, &interaction.token, &closed)
-                        .await;
-                    return None;
-                };
-                let numbers: Vec<String> = data
-                    .values
+            let numbers = || {
+                data.values
                     .iter()
                     .filter_map(|v| v.parse::<usize>().ok())
                     .map(|n| (n + 1).to_string())
-                    .collect();
-                format!("{answer} {}", numbers.join(","))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let asked = if let Some(answer) = data.custom_id.strip_prefix(MENU_PREFIX) {
+                Asked::Said(format!("{answer} {}", numbers()))
+            } else if let Some(menu) = data.custom_id.strip_prefix(MENU_KEPT_PREFIX) {
+                Asked::Numbered {
+                    menu: menu.parse().unwrap_or(0),
+                    numbers: numbers(),
+                }
             } else {
-                data.custom_id.clone()
+                Asked::Said(data.custom_id.clone())
             };
             // The components come off, so it is answered once.
             Some((
-                said,
+                asked,
                 InteractionResponse {
                     kind: InteractionResponseType::UpdateMessage,
                     data: Some(InteractionResponseData {
@@ -890,7 +1014,8 @@ async fn interaction_said(
 }
 
 /// A slash command, a button pressed or a choice made, on to the gateway
-/// as text from the person who used it, after Discord is answered.
+/// as text from the person who used it. Discord is answered first, as it
+/// waits 3 seconds at most.
 async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
     let Some(user) = interaction
         .member
@@ -906,9 +1031,34 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
     let Some(channel) = interaction.channel.as_ref().map(|c| c.id) else {
         return;
     };
-    let Some((said, response)) = interaction_said(ctx, interaction).await else {
+    let Some((asked, response)) = parse_interaction(interaction) else {
         return;
     };
+    let answer = |response: InteractionResponse| async move {
+        if let Err(e) = ctx
+            .dc
+            .respond(interaction.id, &interaction.token, &response)
+            .await
+        {
+            warn!(error = %format!("{e:#}"), "discord: could not answer an interaction");
+        }
+    };
+    if interaction.guild_id.is_some() && !GATEWAY_GROUPS.load(Ordering::Relaxed) {
+        answer(ephemeral("This bot is not used in servers yet.")).await;
+        return;
+    }
+    let said = match asked {
+        Asked::Said(said) => said,
+        Asked::Numbered { menu, numbers } => {
+            let kept = MENUS.lock().ok().and_then(|mut m| m.take(menu));
+            let Some(answer_text) = kept else {
+                answer(ephemeral("This question is no longer open.")).await;
+                return;
+            };
+            format!("{answer_text} {numbers}")
+        }
+    };
+    answer(response).await;
     let sender = user_id(user.id);
     let (group, to) = match interaction.guild_id {
         None => {
@@ -916,15 +1066,8 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
             (None, sender.clone())
         }
         Some(guild) => {
-            if !GATEWAY_GROUPS.load(Ordering::Relaxed) {
-                let not_yet = ephemeral("This bot is not used in servers yet.");
-                let _ = ctx
-                    .dc
-                    .respond(interaction.id, &interaction.token, &not_yet)
-                    .await;
-                return;
-            }
             let Some(place) = place_of(ctx, guild, channel).await else {
+                warn!(%channel, "discord: could not tell where an interaction was used; dropping");
                 return;
             };
             let name = interaction
@@ -937,13 +1080,6 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
             (Some(group), to)
         }
     };
-    if let Err(e) = ctx
-        .dc
-        .respond(interaction.id, &interaction.token, &response)
-        .await
-    {
-        warn!(error = %format!("{e:#}"), "discord: could not answer an interaction");
-    }
     if group.is_none() {
         ctx.typing.start(&to);
     }
@@ -970,43 +1106,65 @@ fn ephemeral(text: &str) -> InteractionResponse {
     }
 }
 
-/// The custom id of a question's menu: this and its number.
+/// The custom id of a question's menu: this and the answer a choice sends
+/// back, when that fits in Discord's 100 characters.
 const MENU_PREFIX: &str = "choose:";
+/// Else this and its number, with the answer kept while the daemon runs.
+const MENU_KEPT_PREFIX: &str = "choose#";
 
-/// Open questions (havn issue #204), by number: what a choice sends back.
+/// Questions whose answer does not fit in their menu (havn issue #204), by
+/// number: what a choice sends back.
 static MENUS: std::sync::LazyLock<Mutex<Bounded<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(Bounded::default()));
 static NEXT_MENU: AtomicU64 = AtomicU64::new(1);
 
-/// The rows of buttons for `buttons`: up to 5 rows of 5, each one's data
-/// what a press sends back. A button whose data or label Discord does not
-/// take is left out; its message says how to answer by typing.
+/// The rows of buttons for `buttons`, each one's data what a press sends
+/// back: their rows when Discord takes them (5 rows of 5), else all of
+/// them flowed into 5 rows of 5. A button Discord would refuse (no label,
+/// data over 100 characters, the same data as another) is left out; its
+/// message says how to answer by typing.
 fn button_rows(buttons: &[Vec<types::Button>]) -> Vec<Component> {
-    buttons
+    let mut seen = std::collections::HashSet::new();
+    let rows: Vec<Vec<&types::Button>> = buttons
         .iter()
-        .take(5)
-        .filter_map(|row| {
-            let components: Vec<Component> = row
-                .iter()
-                .filter(|b| !b.data.is_empty() && b.data.chars().count() <= 100)
-                .take(5)
+        .map(|row| {
+            row.iter()
+                .filter(|b| {
+                    !b.label.trim().is_empty()
+                        && !b.data.is_empty()
+                        && b.data.chars().count() <= 100
+                        && seen.insert(b.data.as_str())
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
+        .collect();
+    let rows: Vec<Vec<&types::Button>> = if rows.len() <= 5 && rows.iter().all(|r| r.len() <= 5) {
+        rows
+    } else {
+        rows.concat().chunks(5).take(5).map(<[_]>::to_vec).collect()
+    };
+    rows.into_iter()
+        .map(|row| {
+            let components = row
+                .into_iter()
                 .map(|b| {
                     Component::Button(Button {
                         custom_id: Some(b.data.clone()),
                         disabled: false,
                         emoji: None,
                         id: None,
-                        label: Some(b.label.chars().take(80).collect()),
+                        label: Some(b.label.trim().chars().take(80).collect()),
                         sku_id: None,
                         style: ButtonStyle::Secondary,
                         url: None,
                     })
                 })
                 .collect();
-            (!components.is_empty()).then_some(Component::ActionRow(ActionRow {
+            Component::ActionRow(ActionRow {
                 components,
                 id: None,
-            }))
+            })
         })
         .collect()
 }
@@ -1017,10 +1175,15 @@ fn question_menu(poll: &types::Poll) -> Option<(String, Vec<Component>)> {
     if poll.options.is_empty() || poll.options.len() > 25 {
         return None;
     }
-    let n = NEXT_MENU.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut menus) = MENUS.lock() {
-        menus.put(n, poll.answer.clone());
-    }
+    let custom_id = if MENU_PREFIX.len() + poll.answer.len() <= 100 {
+        format!("{MENU_PREFIX}{}", poll.answer)
+    } else {
+        let n = NEXT_MENU.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut menus) = MENUS.lock() {
+            menus.put(n, poll.answer.clone());
+        }
+        format!("{MENU_KEPT_PREFIX}{n}")
+    };
     let options = poll
         .options
         .iter()
@@ -1036,7 +1199,7 @@ fn question_menu(poll: &types::Poll) -> Option<(String, Vec<Component>)> {
     let count = u8::try_from(options.len()).unwrap_or(25);
     let menu = Component::SelectMenu(SelectMenu {
         channel_types: None,
-        custom_id: format!("{MENU_PREFIX}{n}"),
+        custom_id,
         default_values: None,
         disabled: false,
         id: None,
@@ -1070,18 +1233,28 @@ async fn reply_channel(
                 .lock()
                 .ok()
                 .and_then(|mut w| w.take(t.get()));
-            if let Some((channel, name)) = waiting {
-                dc.open_thread(channel, t.cast(), &name).await
-            } else {
-                // One named before a restart: opened from the message it
-                // answers, which has the thread's id.
-                if let Some((channel, message)) = in_reply_to
-                    && message.get() == t.get()
-                    && channel != t
-                    && dc.http.channel(t).await.is_err()
-                {
-                    return dc.open_thread(channel, message, "conversation").await;
+            let named_now = waiting.is_some();
+            // One named before a restart is opened from the message it
+            // answers, which has the thread's id.
+            let opening = waiting.or_else(|| {
+                in_reply_to
+                    .filter(|(channel, message)| message.get() == t.get() && *channel != t)
+                    .map(|(channel, _)| (channel, "conversation".to_string()))
+            });
+            let Some((channel, name)) = opening else {
+                return Ok(t);
+            };
+            if named_now || dc.http.channel(t).await.is_err() {
+                match dc.open_thread(channel, t.cast(), &name).await {
+                    Ok(thread) => Ok(thread),
+                    // Not opened (no right to, too many): the reply goes to
+                    // the channel, as a reply to the message.
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "discord: a thread could not be opened; replying in its channel");
+                        Ok(channel)
+                    }
                 }
+            } else {
                 Ok(t)
             }
         }
@@ -1391,6 +1564,36 @@ mod tests {
     }
 
     #[test]
+    fn ten_choices_flow_into_rows_and_buttons_discord_refuses_go() {
+        let b = |label: &str, data: &str| types::Button {
+            label: label.into(),
+            data: data.into(),
+        };
+        let one_per_row: Vec<Vec<types::Button>> = (0..10)
+            .map(|i| vec![b("L", &format!("/choose q {i}"))])
+            .collect();
+        let rows = button_rows(&one_per_row);
+        let sizes: Vec<usize> = rows
+            .iter()
+            .map(|r| match r {
+                Component::ActionRow(row) => row.components.len(),
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(sizes, [5, 5], "all ten kept");
+        let rows = button_rows(&[vec![
+            b("A", "/x"),
+            b("B", "/x"),
+            b("  ", "/y"),
+            b("C", "/z"),
+        ]]);
+        let Component::ActionRow(row) = &rows[0] else {
+            panic!("a row");
+        };
+        assert_eq!(row.components.len(), 2, "a second /x and an empty label go");
+    }
+
+    #[test]
     fn a_question_becomes_a_menu_and_its_choice_its_answer() {
         let poll = types::Poll {
             question: "Which?".into(),
@@ -1406,16 +1609,25 @@ mod tests {
             panic!("a menu");
         };
         assert_eq!(menu.max_values, Some(2));
+        assert_eq!(menu.custom_id, "choose:/answer q1", "the answer is in it");
+        let long = types::Poll {
+            answer: format!("/answer {}", "q".repeat(100)),
+            ..poll.clone()
+        };
+        let (_, rows) = question_menu(&long).expect("menu");
+        let Component::ActionRow(row) = &rows[0] else {
+            panic!("a row");
+        };
+        let Component::SelectMenu(menu) = &row.components[0] else {
+            panic!("a menu");
+        };
         let n: u64 = menu
             .custom_id
-            .strip_prefix(MENU_PREFIX)
-            .expect("ours")
+            .strip_prefix(MENU_KEPT_PREFIX)
+            .expect("kept")
             .parse()
             .expect("n");
-        assert_eq!(
-            MENUS.lock().expect("menus").take(n),
-            Some("/answer q1".into())
-        );
+        assert_eq!(MENUS.lock().expect("menus").take(n), Some(long.answer));
         let many = types::Poll {
             options: (0..26).map(|i| i.to_string()).collect(),
             ..poll

@@ -11,7 +11,7 @@ It runs as its own process, apart from the gateway, and talks to it over the gat
 - **Letting a server in.** The gateway answers only channels it has let in: the owner is told of a channel turned away, with **Allow the whole server** and **Allow this channel** (see [Group chats](https://github.com/amplimit/havn#group-chats) in the Havn README).
 - **Slash commands.** The gateway's commands (`/new`, `/stop`, `/model`, ...) are the bot's slash commands, each with an optional `text` for what follows it. A command shows in the chat as it was asked, and goes to the gateway as if typed.
 - **Buttons** the gateway puts under a message (such as **Approve** and **Deny**) are shown under it. A press goes to the gateway as the button's command from the person who pressed it, and the buttons come off, so it is pressed once.
-- **Questions of several answers** (the agent's `ask_choice`) are a menu that takes several choices; a choice goes back as the person's answer and the menu comes off. Menus are remembered while the daemon runs (the last 1024).
+- **Questions of several answers** (the agent's `ask_choice`) are a menu that takes several choices; a choice goes back as the person's answer and the menu comes off. A menu carries its answer, so it outlives a restart; one whose answer does not fit Discord's 100 characters is remembered while the daemon runs (the last 1024).
 - **Files both ways.** Files someone attaches to a message to the bot go to the gateway (up to 25 MB each), which saves them in the agent's inbox and reads the text of PDFs, Word documents and spreadsheets; a voice message goes as `voice.ogg`, which the gateway transcribes when `[transcription]` is set. A file the agent sends is posted with its caption (up to 10 MB, Discord's limit for a server without boosts); one that cannot be sent is named in a message instead.
 - **Replies and mentions.** A message that replies to another starts with a line saying what it answers (the bot's message, the person's own, or someone else's), its text cut to 500 characters, quoted and marked as user-supplied. Mentions, channels and custom emoji are written as their names (`@ann`, `#general`, `:wave:`).
 - **Formatted replies.** Discord shows the agent's Markdown as it is written. A long reply is split under Discord's 2000 characters at paragraph, line or word breaks; a code block cut in two is closed and opened again.
@@ -143,6 +143,8 @@ Then message the bot privately; the bound agent answers, and typing `/` shows it
 
 ## Limitations
 
+- A mention in a voice or stage channel's chat, where Discord opens no thread, is answered in that chat; so is one where the bot may not open threads (it lacks **Create Public Threads** or **Send Messages in Threads**). A slash command in a channel is answered in the channel, not a thread.
+- A forwarded message is not passed on.
 - Server messages go on only once the gateway has said, when the daemon connects, that it takes them; until then (the first moment after a start) they are dropped.
 - An edited message, a reaction and an embed are not passed on.
 - Stickers are passed on as their names, not their pictures.

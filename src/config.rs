@@ -15,7 +15,7 @@ pub struct Config {
     /// this daemon: havn never sees it.
     pub bot_token: String,
 
-    /// The havn gateway's WebSocket URL, such as `ws://127.0.0.1:8100` or
+    /// The havn gateway's WebSocket URL, such as `ws://127.0.0.1:8080` or
     /// `wss://havn.example.com`; the daemon adds
     /// `/api/v1/channel?channel=<channel_id>&account=<account_id>`.
     pub havn_gateway: String,
@@ -52,8 +52,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut cfg: Self =
-            toml::from_str(&raw).with_context(|| format!("parsing {} as TOML", path.display()))?;
+        // The parser's message only: its excerpt of the file may show a token.
+        let mut cfg: Self = toml::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parsing {} as TOML: {}", path.display(), e.message()))?;
         cfg.validate()?;
         Ok(cfg)
     }

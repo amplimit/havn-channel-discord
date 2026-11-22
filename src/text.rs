@@ -23,7 +23,9 @@ pub fn split(text: &str) -> Vec<String> {
     while !rest.is_empty() {
         let head = fence.as_ref().map(|f| format!("{f}\n")).unwrap_or_default();
         // Room for the head, and for closing a block left open.
-        let budget = PART_CHARS - head.chars().count() - "\n```".len();
+        let budget = PART_CHARS
+            .saturating_sub(head.chars().count() + "\n```".len())
+            .max(1);
         if rest.chars().count() <= budget {
             parts.push(format!("{head}{rest}"));
             break;
@@ -77,7 +79,17 @@ fn fence_after(mut open: Option<String>, part: &str) -> Option<String> {
                 Some(_) => None,
                 // A fence that closes on its own line, as ```x```, opens none.
                 None if info.contains("```") => None,
-                None => Some(line.to_string()),
+                // Opened again with its language only, short.
+                None => {
+                    let language: String = info
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(20)
+                        .collect();
+                    Some(format!("```{language}"))
+                }
             };
         }
     }
@@ -107,11 +119,14 @@ pub fn readable(content: &str, names: &Names) -> String {
             return out;
         };
         let inner = &after[1..end];
-        match token(inner, names) {
-            Some(shown) => out.push_str(&shown),
-            None => out.push_str(&after[..=end]),
+        if let Some(shown) = token(inner, names) {
+            out.push_str(&shown);
+            rest = &after[end + 1..];
+        } else {
+            // A `<` that opens no token is text; what follows is read on.
+            out.push('<');
+            rest = &after[1..];
         }
-        rest = &after[end + 1..];
     }
     out.push_str(rest);
     out
@@ -166,25 +181,17 @@ fn token(inner: &str, names: &Names) -> Option<String> {
     None
 }
 
-/// A thread's name from the message that opened it: its first line
-/// without the bot's mention, cut to a word under [`THREAD_NAME_CHARS`];
-/// "conversation" when nothing is left.
+/// A thread's name from the message that opened it (its text without the
+/// bot's mention): its first line, cut to a word under
+/// [`THREAD_NAME_CHARS`]; "conversation" when nothing is left.
 pub fn thread_name(content: &str) -> String {
     let line = content
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or_default();
-    let words: Vec<&str> = line
-        .split_whitespace()
-        .filter(|w| {
-            !(w.starts_with('@')
-                && w.len() > 1
-                && w == &line.split_whitespace().next().unwrap_or_default())
-        })
-        .collect();
     let mut name = String::new();
-    for word in words {
+    for word in line.split_whitespace() {
         let next = if name.is_empty() {
             word.to_string()
         } else {
@@ -255,6 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_with_a_long_line_still_ends() {
+        let text = format!("```{}\n{}\n```", "x".repeat(3000), "y\n".repeat(2000));
+        let parts = split(&text);
+        assert!(parts.len() < 20, "{}", parts.len());
+        for p in &parts {
+            assert!(p.chars().count() <= 2000, "{}", p.chars().count());
+        }
+    }
+
+    #[test]
     fn a_word_longer_than_a_part_is_cut_anywhere() {
         let parts = split(&"x".repeat(4500));
         assert_eq!(parts.len(), 3);
@@ -275,15 +292,18 @@ mod tests {
             "@ann @ann @mods in #general :wave: :dance: 1700000000"
         );
         assert_eq!(readable("<@9> a < b > c <x", &names), "@9 a < b > c <x");
+        assert_eq!(
+            readable("a < b <@1>", &names),
+            "a < b @ann",
+            "a stray < keeps the mention"
+        );
     }
 
     #[test]
     fn a_thread_is_named_from_the_first_line_without_the_mention() {
-        assert_eq!(
-            thread_name("@bot what is the plan?\nmore"),
-            "what is the plan?"
-        );
-        assert_eq!(thread_name("@bot"), "conversation");
+        assert_eq!(thread_name(" what is the plan?\nmore"), "what is the plan?");
+        assert_eq!(thread_name("hey @ann, the plan?"), "hey @ann, the plan?");
+        assert_eq!(thread_name("  "), "conversation");
         assert_eq!(thread_name(""), "conversation");
         let long = thread_name(&"word ".repeat(40));
         assert!(long.chars().count() <= 80 && !long.ends_with(' '), "{long}");

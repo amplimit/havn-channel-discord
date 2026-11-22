@@ -42,13 +42,24 @@ const OUTBOUND_CAPACITY: usize = 128;
 /// task applies backpressure naturally.
 const INBOUND_CAPACITY: usize = 128;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WsConfig {
     pub gateway_url: String,
     pub adapter_token: String,
     pub channel_id: String,
     pub account_id: String,
     pub delivered: Arc<Delivered>,
+}
+
+// The token is not shown.
+impl std::fmt::Debug for WsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConfig")
+            .field("gateway_url", &self.gateway_url)
+            .field("channel_id", &self.channel_id)
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where the daemon is in the gateway's numbering of its replies (issue
