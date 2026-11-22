@@ -279,23 +279,18 @@ impl Workers {
     /// the one there just ended).
     fn pass(&self, ctx: &Ctx, mut message: Box<MessageCreate>) {
         let channel = message.channel_id;
+        // Sent under the lock (an unbounded send does not wait), so a worker
+        // that ends, which takes it too, has nothing left behind.
+        let mut workers = self.lock();
         loop {
-            let queue = self
-                .lock()
+            let queue = workers
                 .entry(channel)
-                .or_insert_with(|| self.start(ctx, channel))
-                .clone();
+                .or_insert_with(|| self.start(ctx, channel));
             match queue.send(message) {
                 Ok(()) => return,
                 Err(back) => {
                     message = back.0;
-                    let mut workers = self.lock();
-                    if workers
-                        .get(&channel)
-                        .is_some_and(|q| q.same_channel(&queue))
-                    {
-                        workers.remove(&channel);
-                    }
+                    workers.remove(&channel);
                 }
             }
         }
@@ -307,18 +302,22 @@ impl Workers {
         let workers = self.clone();
         let own = queue.clone();
         tokio::spawn(async move {
-            while let Ok(Some(message)) = tokio::time::timeout(WORKER_IDLE, messages.recv()).await {
-                on_message(&ctx, &message).await;
-            }
-            // What came as it ended goes on; what comes after finds it
-            // closed, and starts another.
-            messages.close();
-            while let Ok(message) = messages.try_recv() {
-                on_message(&ctx, &message).await;
-            }
-            let mut all = workers.lock();
-            if all.get(&channel).is_some_and(|q| q.same_channel(&own)) {
-                all.remove(&channel);
+            loop {
+                match tokio::time::timeout(WORKER_IDLE, messages.recv()).await {
+                    Ok(Some(message)) => on_message(&ctx, &message).await,
+                    Ok(None) => return,
+                    // Idle: it ends only when nothing came meanwhile, as the
+                    // map's lock is held.
+                    Err(_) => {
+                        let mut all = workers.lock();
+                        if messages.is_empty() {
+                            if all.get(&channel).is_some_and(|q| q.same_channel(&own)) {
+                                all.remove(&channel);
+                            }
+                            return;
+                        }
+                    }
+                }
             }
         });
         queue
@@ -523,6 +522,23 @@ static WAITING_THREADS: std::sync::LazyLock<Mutex<WaitingThreads>> =
     std::sync::LazyLock::new(|| Mutex::new(Bounded::default()));
 
 type WaitingThreads = Bounded<(Id<ChannelMarker>, String)>;
+
+/// Threads that could not be opened: their channel, which their replies
+/// go to.
+static UNOPENED_THREADS: std::sync::LazyLock<Mutex<Bounded<Id<ChannelMarker>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Bounded::default()));
+
+/// Channels where a thread could not be opened (no right to): a mention
+/// there is answered in the channel, as one conversation.
+static NO_THREADS: std::sync::LazyLock<Mutex<Bounded<()>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Bounded::default()));
+
+fn threads_fail_in(channel: Id<ChannelMarker>) -> bool {
+    NO_THREADS
+        .lock()
+        .ok()
+        .is_some_and(|n| n.get(channel.get()).is_some())
+}
 
 /// A map that forgets its oldest past [`Bounded::KEPT`].
 struct Bounded<V> {
@@ -752,7 +768,7 @@ async fn server_group(
     let addressed = in_own_thread || mentions_bot(ctx, message);
     let thread = if place.thread.is_some() {
         thread_of(&place)
-    } else if addressed && opens_threads(place.channel_kind) {
+    } else if addressed && opens_threads(place.channel_kind) && !threads_fail_in(place.channel) {
         // A mention in a channel starts a conversation of its own, named
         // from it without the bot's mention.
         let name = text::thread_name(&text::readable(
@@ -889,15 +905,23 @@ async fn receive(
         .acquire()
         .await
         .context("file transfers stopped")?;
-    let bytes = ctx.dc.download(&file.url, gateway::MAX_FILE_BYTES).await?;
-    let media_type = file
-        .content_type
-        .clone()
-        .unwrap_or_else(|| "application/octet-stream".into());
-    ctx.gateway
-        .upload(sender, group, name, &media_type, bytes)
-        .await
+    // One sender's slow file does not hold up everyone's for long.
+    tokio::time::timeout(TRANSFER_FOR, async {
+        let bytes = ctx.dc.download(&file.url, gateway::MAX_FILE_BYTES).await?;
+        let media_type = file
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".into());
+        ctx.gateway
+            .upload(sender, group, name, &media_type, bytes)
+            .await
+    })
+    .await
+    .unwrap_or_else(|_| anyhow::bail!("the transfer took over {} s", TRANSFER_FOR.as_secs()))
 }
+
+/// The longest a file takes, from Discord to the gateway.
+const TRANSFER_FOR: Duration = Duration::from_secs(150);
 
 async fn send_inbound(
     ctx: &Ctx,
@@ -1215,8 +1239,28 @@ async fn reply_channel(
 ) -> Result<Id<ChannelMarker>> {
     match target_of(to).with_context(|| format!("not a place to send to: {to:?}"))? {
         Target::Person(user) => dc.dm(user).await,
-        Target::Channel(c) => Ok(c),
+        Target::Channel(c) => {
+            // The answer to a message in a thread of the channel (a refusal,
+            // havn issue #288) goes to that thread.
+            if let Some((written, _)) = in_reply_to
+                && written != c
+                && let Ok(found) = dc.http.channel(written).await
+                && let Ok(thread) = found.model().await
+                && is_thread(thread.kind)
+                && thread.parent_id == Some(c)
+            {
+                return Ok(written);
+            }
+            Ok(c)
+        }
         Target::Thread(t) => {
+            if let Some(channel) = UNOPENED_THREADS
+                .lock()
+                .ok()
+                .and_then(|u| u.get(t.get()).copied())
+            {
+                return Ok(channel);
+            }
             let waiting = WAITING_THREADS
                 .lock()
                 .ok()
@@ -1237,8 +1281,20 @@ async fn reply_channel(
                     Ok(thread) => Ok(thread),
                     // Not opened (no right to, too many): the reply goes to
                     // the channel, as a reply to the message.
+                    // Its next replies go there too, and so do the next
+                    // mentions' when it had no right to.
                     Err(e) => {
                         warn!(error = %format!("{e:#}"), "discord: a thread could not be opened; replying in its channel");
+                        if let Ok(mut unopened) = UNOPENED_THREADS.lock() {
+                            unopened.put(t.get(), channel);
+                        }
+                        if e.downcast_ref::<twilight_http::Error>()
+                            .and_then(discord::api_code)
+                            == Some(discord::code::MISSING_PERMISSIONS)
+                            && let Ok(mut none) = NO_THREADS.lock()
+                        {
+                            none.put(channel.get(), ());
+                        }
                         Ok(channel)
                     }
                 }

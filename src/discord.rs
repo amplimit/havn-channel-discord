@@ -35,6 +35,8 @@ pub const COMMAND_TEXT: &str = "text";
 
 /// Discord's error codes the adapter tells apart.
 pub mod code {
+    /// The bot may not do it here.
+    pub const MISSING_PERMISSIONS: u64 = 50013;
     /// A thread was opened from that message already.
     pub const THREAD_EXISTS: u64 = 160_004;
 }
@@ -243,7 +245,7 @@ impl Discord {
         {
             Ok(_) => Ok(message.cast()),
             Err(e) if api_code(&e) == Some(code::THREAD_EXISTS) => Ok(message.cast()),
-            Err(e) => Err(e).context("opening a thread"),
+            Err(e) => Err(anyhow::Error::new(e).context("opening a thread")),
         }
     }
 
