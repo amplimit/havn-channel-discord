@@ -333,6 +333,12 @@ fn slash_command(c: &ChannelCommand) -> Option<Command> {
     if description.is_empty() {
         description = name.to_string();
     }
+    // A command that takes nothing has no field for it (havn issue #294);
+    // one that takes something says what.
+    let options = match c.args.as_deref().map(str::trim) {
+        Some("") => Vec::new(),
+        args => vec![text_option(args)],
+    };
     Some(Command {
         application_id: None,
         contexts: Some(vec![
@@ -351,25 +357,35 @@ fn slash_command(c: &ChannelCommand) -> Option<Command> {
         name: name.to_string(),
         name_localizations: None,
         nsfw: None,
-        options: vec![CommandOption {
-            autocomplete: None,
-            channel_types: None,
-            choices: None,
-            description: "What follows the command".into(),
-            description_localizations: None,
-            kind: CommandOptionType::String,
-            max_length: Some(1900),
-            max_value: None,
-            min_length: None,
-            min_value: None,
-            name: COMMAND_TEXT.into(),
-            name_localizations: None,
-            options: None,
-            file_types: None,
-            required: Some(false),
-        }],
+        options,
         version: Id::new(1),
     })
+}
+
+/// The optional [`COMMAND_TEXT`] of a command, described by what it takes,
+/// as `[name | number]`, when that is known.
+fn text_option(args: Option<&str>) -> CommandOption {
+    let description = match args {
+        Some(args) => args.chars().take(100).collect(),
+        None => "What follows the command".into(),
+    };
+    CommandOption {
+        autocomplete: None,
+        channel_types: None,
+        choices: None,
+        description,
+        description_localizations: None,
+        kind: CommandOptionType::String,
+        max_length: Some(1900),
+        max_value: None,
+        min_length: None,
+        min_value: None,
+        name: COMMAND_TEXT.into(),
+        name_localizations: None,
+        options: None,
+        file_types: None,
+        required: Some(false),
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +397,7 @@ mod tests {
         let c = |name: &str, description: &str| ChannelCommand {
             name: name.into(),
             description: description.into(),
+            args: None,
         };
         let made = slash_command(&c("model", "Choose the model")).expect("valid");
         assert_eq!(made.name, "model");
@@ -402,6 +419,33 @@ mod tests {
             assert!(slash_command(&c(bad, "d")).is_none(), "{bad}");
         }
         assert_eq!(made.options[0].max_length, Some(1900));
+    }
+
+    #[test]
+    fn a_command_has_a_text_field_only_when_it_takes_something() {
+        let with = |args: Option<&str>| {
+            slash_command(&ChannelCommand {
+                name: "model".into(),
+                description: "Choose the model".into(),
+                args: args.map(Into::into),
+            })
+            .expect("valid")
+            .options
+        };
+        assert!(with(Some("")).is_empty(), "/new takes nothing");
+        assert!(with(Some("  ")).is_empty());
+        let named = with(Some("[name | number | default]"));
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].description, "[name | number | default]");
+        assert_eq!(
+            with(None)[0].description,
+            "What follows the command",
+            "an older gateway's may take anything"
+        );
+        assert_eq!(
+            with(Some(&"a".repeat(150)))[0].description.chars().count(),
+            100
+        );
     }
 
     #[test]

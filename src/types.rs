@@ -41,6 +41,10 @@ pub struct ChannelCommand {
     /// Without the slash.
     pub name: String,
     pub description: String,
+    /// What it takes after its name (havn issue #294), empty for nothing;
+    /// absent from an older gateway, when it may take anything.
+    #[serde(default)]
+    pub args: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

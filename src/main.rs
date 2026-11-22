@@ -1353,7 +1353,18 @@ async fn havn_outbound_loop(
     Ok(())
 }
 
+/// Whether reply `o` has nothing to send: the end of one whose parts went
+/// already, or an empty answer. It opens no thread (issue #2).
+fn says_nothing(o: &ChannelOutbound) -> bool {
+    o.poll.is_none()
+        && o.buttons.iter().all(Vec::is_empty)
+        && matches!(&o.content, ChannelMessageContent::Text { text } if text.trim().is_empty())
+}
+
 async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result<()> {
+    if says_nothing(o) {
+        return Ok(());
+    }
     let answers = o.in_reply_to.as_deref().and_then(parse_message_id);
     let channel = reply_channel(dc, &o.to, answers).await?;
     // A reply answers its message where that is in the same channel.
@@ -1569,6 +1580,33 @@ mod tests {
         ] {
             assert_eq!(target_of(not), None, "{not}");
         }
+    }
+
+    #[test]
+    fn a_reply_with_nothing_to_send_is_told_apart() {
+        let reply = |v: serde_json::Value| -> ChannelOutbound {
+            let mut frame = serde_json::json!({
+                "seq": 1, "account_id": "a", "to": "discord:t5",
+                "content": {"type": "text", "text": ""}
+            });
+            if let (Some(frame), Some(more)) = (frame.as_object_mut(), v.as_object()) {
+                frame.extend(more.clone());
+            }
+            serde_json::from_value(frame).expect("frame")
+        };
+        assert!(says_nothing(&reply(serde_json::json!({}))));
+        assert!(says_nothing(&reply(serde_json::json!({
+            "content": {"type": "text", "text": " \n "}
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "content": {"type": "text", "text": "hi"}
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "buttons": [[{"label": "Approve", "data": "/approve"}]]
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "poll": {"question": "Which?", "options": ["a", "b"], "answer": "/choose q"}
+        }))));
     }
 
     #[test]
