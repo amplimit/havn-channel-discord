@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use reqwest::header::CONTENT_TYPE;
 
-use crate::types::Attachment;
+use crate::types::{Attachment, ChannelGroup};
 
 /// The largest file passed either way: the gateway's limit.
 pub const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
@@ -66,13 +66,13 @@ impl Gateway {
         Ok(url)
     }
 
-    /// Give the gateway file `name` that `sender` sent, in `place` (the
-    /// channel and its server) or a private chat; the attachment their
-    /// message then names.
+    /// Give the gateway file `name` that `sender` sent, in `group` (a
+    /// server's channel, with its server and thread) or a private chat; the
+    /// attachment their message then names.
     pub async fn upload(
         &self,
         sender: &str,
-        place: Option<(&str, &str)>,
+        group: Option<&ChannelGroup>,
         name: &str,
         media_type: &str,
         bytes: Vec<u8>,
@@ -81,12 +81,16 @@ impl Gateway {
         url.query_pairs_mut()
             .append_pair("sender", sender)
             .append_pair("name", name);
-        // In a server's channel the gateway lets the channel or its server
-        // in (havn issues #263, #285).
-        if let Some((group, space)) = place {
-            url.query_pairs_mut()
-                .append_pair("group", group)
-                .append_pair("space", space);
+        // In a server's channel the gateway lets the channel, its server or
+        // its thread in (havn issues #263, #285, #288).
+        if let Some(g) = group {
+            url.query_pairs_mut().append_pair("group", &g.id);
+            if let Some(space) = &g.space {
+                url.query_pairs_mut().append_pair("space", &space.id);
+            }
+            if let Some(thread) = &g.thread {
+                url.query_pairs_mut().append_pair("thread", &thread.id);
+            }
         }
         let bytes = bytes::Bytes::from(bytes);
         // The account's uploads at once are few: when they are all

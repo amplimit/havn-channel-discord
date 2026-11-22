@@ -790,12 +790,6 @@ async fn message_files(
         }
         return attachments;
     }
-    let place = group.map(|g| {
-        (
-            g.id.clone(),
-            g.space.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
-        )
-    });
     let voice = message
         .flags
         .is_some_and(|f| f.contains(MessageFlags::IS_VOICE_MESSAGE));
@@ -805,7 +799,7 @@ async fn message_files(
         } else {
             file.filename.clone()
         };
-        match receive(ctx, sender, place.as_ref(), file, &name).await {
+        match receive(ctx, sender, group, file, &name).await {
             Ok(a) => attachments.push(a),
             Err(e) => {
                 warn!(file = %file.filename, error = %format!("{e:#}"), "discord: a file could not be passed on");
@@ -880,11 +874,11 @@ async fn on_message(ctx: &Ctx, message: &Message) {
 }
 
 /// File `file` on to the gateway, named `name`, as `sender` sent it in
-/// `place` (the channel and its server) or privately.
+/// `group` (a server's channel, with its server and thread) or privately.
 async fn receive(
     ctx: &Ctx,
     sender: &str,
-    place: Option<&(String, String)>,
+    group: Option<&ChannelGroup>,
     file: &twilight_model::channel::Attachment,
     name: &str,
 ) -> Result<Attachment> {
@@ -901,13 +895,7 @@ async fn receive(
         .clone()
         .unwrap_or_else(|| "application/octet-stream".into());
     ctx.gateway
-        .upload(
-            sender,
-            place.map(|(g, s)| (g.as_str(), s.as_str())),
-            name,
-            &media_type,
-            bytes,
-        )
+        .upload(sender, group, name, &media_type, bytes)
         .await
 }
 
