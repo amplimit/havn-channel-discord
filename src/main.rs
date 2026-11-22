@@ -1356,8 +1356,8 @@ async fn havn_outbound_loop(
 /// Whether reply `o` has nothing to send: the end of one whose parts went
 /// already, or an empty answer. It opens no thread (issue #2).
 fn says_nothing(o: &ChannelOutbound) -> bool {
-    o.poll.is_none()
-        && o.buttons.iter().all(Vec::is_empty)
+    o.poll.as_ref().and_then(question_menu).is_none()
+        && button_rows(&o.buttons).is_empty()
         && matches!(&o.content, ChannelMessageContent::Text { text } if text.trim().is_empty())
 }
 
@@ -1433,10 +1433,6 @@ async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result
             None => format!("[contact: {display_name}]"),
         },
     };
-    // The end of a reply whose parts went already says nothing more.
-    if text.trim().is_empty() && o.buttons.is_empty() {
-        return Ok(());
-    }
     dc.send_text(channel, &text, reply, &button_rows(&o.buttons))
         .await
 }
@@ -1606,6 +1602,14 @@ mod tests {
         }))));
         assert!(!says_nothing(&reply(serde_json::json!({
             "poll": {"question": "Which?", "options": ["a", "b"], "answer": "/choose q"}
+        }))));
+        // Buttons Discord would not take, and a menu that cannot be made,
+        // are nothing either.
+        assert!(says_nothing(&reply(serde_json::json!({
+            "buttons": [[], [{"label": " ", "data": "/approve"}]]
+        }))));
+        assert!(says_nothing(&reply(serde_json::json!({
+            "poll": {"question": "Which?", "options": [], "answer": "/choose q"}
         }))));
     }
 
