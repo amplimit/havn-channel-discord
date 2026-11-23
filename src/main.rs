@@ -1181,10 +1181,15 @@ fn button_rows(buttons: &[Vec<types::Button>]) -> Vec<Component> {
         .collect()
 }
 
+/// Whether Discord takes `poll` as a menu: 1 to 25 options.
+fn menu_fits(poll: &types::Poll) -> bool {
+    (1..=25).contains(&poll.options.len())
+}
+
 /// A question of several answers as a menu that takes several, under its
 /// text; `None` when Discord would not take it (over 25 options).
 fn question_menu(poll: &types::Poll) -> Option<(String, Vec<Component>)> {
-    if poll.options.is_empty() || poll.options.len() > 25 {
+    if !menu_fits(poll) {
         return None;
     }
     let custom_id = if MENU_PREFIX.len() + poll.answer.len() <= 100 {
@@ -1353,7 +1358,18 @@ async fn havn_outbound_loop(
     Ok(())
 }
 
+/// Whether reply `o` has nothing to send: the end of one whose parts went
+/// already, or an empty answer. It opens no thread (issue #2).
+fn says_nothing(o: &ChannelOutbound) -> bool {
+    !o.poll.as_ref().is_some_and(menu_fits)
+        && button_rows(&o.buttons).is_empty()
+        && matches!(&o.content, ChannelMessageContent::Text { text } if text.trim().is_empty())
+}
+
 async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result<()> {
+    if says_nothing(o) {
+        return Ok(());
+    }
     let answers = o.in_reply_to.as_deref().and_then(parse_message_id);
     let channel = reply_channel(dc, &o.to, answers).await?;
     // A reply answers its message where that is in the same channel.
@@ -1422,10 +1438,6 @@ async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result
             None => format!("[contact: {display_name}]"),
         },
     };
-    // The end of a reply whose parts went already says nothing more.
-    if text.trim().is_empty() && o.buttons.is_empty() {
-        return Ok(());
-    }
     dc.send_text(channel, &text, reply, &button_rows(&o.buttons))
         .await
 }
@@ -1569,6 +1581,41 @@ mod tests {
         ] {
             assert_eq!(target_of(not), None, "{not}");
         }
+    }
+
+    #[test]
+    fn a_reply_with_nothing_to_send_is_told_apart() {
+        let reply = |v: serde_json::Value| -> ChannelOutbound {
+            let mut frame = serde_json::json!({
+                "seq": 1, "account_id": "a", "to": "discord:t5",
+                "content": {"type": "text", "text": ""}
+            });
+            if let (Some(frame), Some(more)) = (frame.as_object_mut(), v.as_object()) {
+                frame.extend(more.clone());
+            }
+            serde_json::from_value(frame).expect("frame")
+        };
+        assert!(says_nothing(&reply(serde_json::json!({}))));
+        assert!(says_nothing(&reply(serde_json::json!({
+            "content": {"type": "text", "text": " \n "}
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "content": {"type": "text", "text": "hi"}
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "buttons": [[{"label": "Approve", "data": "/approve"}]]
+        }))));
+        assert!(!says_nothing(&reply(serde_json::json!({
+            "poll": {"question": "Which?", "options": ["a", "b"], "answer": "/choose q"}
+        }))));
+        // Buttons Discord would not take, and a menu that cannot be made,
+        // are nothing either.
+        assert!(says_nothing(&reply(serde_json::json!({
+            "buttons": [[], [{"label": " ", "data": "/approve"}]]
+        }))));
+        assert!(says_nothing(&reply(serde_json::json!({
+            "poll": {"question": "Which?", "options": [], "answer": "/choose q"}
+        }))));
     }
 
     #[test]
