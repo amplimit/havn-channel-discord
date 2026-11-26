@@ -1365,9 +1365,9 @@ async fn reply_channel(
     }
 }
 
-/// havn to Discord: each reply is delivered, or shown in the messages of
-/// the reply being written it ends ([`Replies`]), each reply being written
-/// shown there, and the menu set from the gateway's commands.
+/// havn to Discord: each reply and reply being written goes to the worker
+/// of its conversation ([`Chats`]), which delivers them in order, and the
+/// menu is set from the gateway's commands.
 async fn havn_outbound_loop(
     dc: Discord,
     gateway: Gateway,
@@ -1376,16 +1376,16 @@ async fn havn_outbound_loop(
     delivered: Arc<havn_ws::Delivered>,
 ) -> Result<()> {
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
-    let mut replies = Replies::new(typing.clone());
+    // Each conversation's replies go through its own worker, in order (havn
+    // issue #325): a wait in one holds up no other.
+    let mut chats = Chats::new(dc.clone(), gateway, typing, delivered);
     let mut idle = tokio::time::interval(LIVE_IDLE_EVERY);
     loop {
-        // Frames first: a reply is judged idle only once those that came
-        // for it are read.
         let frame = tokio::select! {
             biased;
             frame = inbound_rx.recv() => frame,
             _ = idle.tick() => {
-                replies.idle();
+                chats.idle();
                 continue;
             }
         };
@@ -1408,22 +1408,8 @@ async fn havn_outbound_loop(
                     }
                 }
             }
-            ChannelFrame::Writing(w) => replies.writing(&dc, w),
-            ChannelFrame::Outbound(o) => {
-                // A part of a reply being written, or its end, takes the
-                // place of what was shown; any other goes as it is.
-                if !replies.reply(&o)
-                    && let Err(e) = deliver(&dc, &gateway, &o).await
-                {
-                    warn!(error = %format!("{e:#}"), seq = o.seq, "discord: a reply could not be delivered");
-                }
-                delivered.mark(o.seq);
-                if o.partial {
-                    typing.more(&o.to);
-                } else {
-                    typing.replied(&o.to);
-                }
-            }
+            ChannelFrame::Writing(w) => chats.writing(w),
+            ChannelFrame::Outbound(o) => chats.outbound(o).await,
             ChannelFrame::Pong => {}
             ChannelFrame::Inbound(_) | ChannelFrame::Resume(_) | ChannelFrame::Ping => {
                 debug!("dropping a frame the gateway does not send");
@@ -1852,113 +1838,28 @@ impl Written {
 /// whether the text is only the gateway's line saying it is being written.
 type Showing = (String, Vec<Vec<types::Button>>, bool);
 
-/// What the task of a reply being written is given.
-enum Command {
-    /// A model call's text so far: shown at the pace of [`LIVE_EVERY`],
-    /// the latest only.
-    Show(Showing),
-    /// A part of the reply (`partial`) or its end, to put in its messages.
-    Put { text: String, partial: bool },
-}
-
-/// Show reply `reply` to `to` as its task is told (havn issue #325), where
-/// it goes (a thread waiting to be opened is opened), at most every
-/// [`LIVE_EVERY`], waiting out Discord's rate limits here, not where the
-/// other replies go. A call after a part is shown below it. It ends with
-/// the reply's end, when it had nowhere to go, or when it is no longer told
-/// anything: then its buttons come off, and a message that only says the
-/// reply is being written goes.
-async fn write_live(
-    dc: Discord,
-    reply: String,
-    to: String,
-    in_reply_to: Option<String>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Command>,
-) {
-    let answers = in_reply_to.as_deref().and_then(parse_message_id);
-    let channel = match reply_channel(&dc, &to, answers).await {
-        Ok(channel) => channel,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "discord: nowhere to show a reply being written");
-            return;
-        }
-    };
-    let mut written = Written::new(
-        &reply,
-        channel,
-        answers.and_then(|(c, m)| (c == channel).then_some(m)),
-    );
-    // A part is shown, and what comes next goes below it.
-    let mut part = false;
-    let mut latest: Option<Showing> = None;
-    let mut next = tokio::time::Instant::now();
-    loop {
-        let command = if latest.is_some() {
-            tokio::select! {
-                biased;
-                command = rx.recv() => command,
-                () = tokio::time::sleep_until(next) => {
-                    if let Some((text, buttons, waiting)) = latest.take() {
-                        written.buttons = buttons;
-                        written.waiting = waiting;
-                        written.show(&dc, &text, true, false).await;
-                        next = tokio::time::Instant::now() + LIVE_EVERY;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            rx.recv().await
-        };
-        match command {
-            None => {
-                if written.waiting {
-                    written.show(&dc, "", false, true).await;
-                } else {
-                    written.drop_buttons(&dc).await;
-                }
-                return;
-            }
-            Some(Command::Show(showing)) => {
-                if std::mem::take(&mut part) {
-                    written.drop_buttons(&dc).await;
-                    written = written.below();
-                }
-                latest = Some(showing);
-            }
-            Some(Command::Put { text, partial }) => {
-                latest = None;
-                if std::mem::take(&mut part) {
-                    written.drop_buttons(&dc).await;
-                    written = written.below();
-                }
-                written.show(&dc, &text, partial, true).await;
-                written.waiting = false;
-                if !partial {
-                    return;
-                }
-                part = true;
-            }
-        }
-    }
-}
-
-/// A reply being written (havn issue #325): its task, and when it last got
-/// something.
+/// A reply being written in a conversation (havn issue #325).
 struct Live {
-    tx: tokio::sync::mpsc::UnboundedSender<Command>,
+    written: Written,
+    /// The latest text of its model call not shown yet.
+    latest: Option<Showing>,
+    /// When it may be edited next.
+    next: tokio::time::Instant,
+    /// A part of it is shown: what comes next goes below it.
+    part: bool,
+    /// When it last got a frame.
     seen: tokio::time::Instant,
 }
 
-/// The replies being written, by the gateway's id, oldest first; those
-/// waiting for text before they open their thread; and those that ended
+/// The replies being written in one conversation, oldest first; those
+/// waiting for text before they open its thread; and those that ended
 /// lately.
 struct Replies {
     live: HashMap<String, Live>,
     order: VecDeque<String>,
-    /// Replies whose thread is not opened yet, by `to`: they show the
-    /// typing indicator until they have text.
-    unopened: HashMap<String, String>,
+    /// Replies whose thread is not opened yet: they show the typing
+    /// indicator until they have text.
+    unopened: std::collections::HashSet<String>,
     ended: VecDeque<String>,
     typing: Typing,
 }
@@ -1968,18 +1869,17 @@ impl Replies {
         Self {
             live: HashMap::new(),
             order: VecDeque::new(),
-            unopened: HashMap::new(),
+            unopened: std::collections::HashSet::new(),
             ended: VecDeque::new(),
             typing,
         }
     }
 
     /// `reply` ended: its Stop button stops nothing, and a frame of it
-    /// that comes late shows nothing. Its task, if it is still told
-    /// something, finishes it.
-    fn end(&mut self, reply: String) {
+    /// that comes late shows nothing. What it showed, to finish.
+    fn end(&mut self, reply: String) -> Option<Live> {
         self.order.retain(|r| *r != reply);
-        self.live.remove(&reply);
+        let live = self.live.remove(&reply);
         stops().remove(&reply);
         self.unopened.remove(&reply);
         self.ended.retain(|r| *r != reply);
@@ -1987,11 +1887,24 @@ impl Replies {
         while self.ended.len() > ENDED_KEPT {
             self.ended.pop_front();
         }
+        live
     }
 
-    /// Finish the replies that got nothing for [`LIVE_IDLE`], as they are
-    /// shown.
-    fn idle(&mut self) {
+    /// Finish `live` as it is shown: its buttons come off, its text stays;
+    /// a message saying only that the reply is being written goes.
+    async fn finish(dc: &Discord, live: Option<Live>) {
+        let Some(mut live) = live else {
+            return;
+        };
+        if live.written.waiting {
+            live.written.show(dc, "", false, true).await;
+        } else {
+            live.written.drop_buttons(dc).await;
+        }
+    }
+
+    /// Finish the replies that got nothing for [`LIVE_IDLE`].
+    async fn idle(&mut self, dc: &Discord) {
         let now = tokio::time::Instant::now();
         let idle: Vec<String> = self
             .live
@@ -2001,75 +1914,115 @@ impl Replies {
             .collect();
         for reply in idle {
             info!("discord: a reply being written got nothing for a while; finished as it is");
-            self.end(reply);
+            let live = self.end(reply);
+            Self::finish(dc, live).await;
         }
     }
 
-    /// Show `w`: in its reply's messages, or in new ones; nothing for a
-    /// reply that ended. One that only says the reply is still being
-    /// written shows nothing and keeps it. A reply whose thread is not
-    /// opened yet opens it with its first text: until then the typing
-    /// indicator shows, so a reply that says nothing opens no thread.
-    fn writing(&mut self, dc: &Discord, w: types::ChannelWriting) {
+    /// When the next reply is due to be edited.
+    fn due(&self) -> Option<tokio::time::Instant> {
+        self.live
+            .values()
+            .filter(|live| live.latest.is_some())
+            .map(|live| live.next)
+            .min()
+    }
+
+    /// Edit the replies due, each with its latest text, at most every
+    /// [`LIVE_EVERY`].
+    async fn edit_due(&mut self, dc: &Discord) {
+        let now = tokio::time::Instant::now();
+        for live in self.live.values_mut() {
+            if live.next > now {
+                continue;
+            }
+            let Some((text, buttons, waiting)) = live.latest.take() else {
+                continue;
+            };
+            live.written.buttons = buttons;
+            live.written.waiting = waiting;
+            live.written.show(dc, &text, true, false).await;
+            live.next = tokio::time::Instant::now() + LIVE_EVERY;
+        }
+    }
+
+    /// Take `w`: its text for its reply's messages, or for new ones (below
+    /// a part of it shown, which loses its buttons), where its reply goes;
+    /// nothing for a reply that ended, or that had nowhere to go. One that
+    /// only says the reply is still being written shows nothing and keeps
+    /// it. A reply whose thread is not opened yet opens it with its first
+    /// text: until then the typing indicator shows, so a reply that says
+    /// nothing opens no thread.
+    async fn writing(&mut self, dc: &Discord, w: types::ChannelWriting) {
         if self.ended.contains(&w.reply) {
             return;
         }
+        let now = tokio::time::Instant::now();
         if let Some(live) = self.live.get_mut(&w.reply) {
-            live.seen = tokio::time::Instant::now();
-            if !w.alive {
-                let _ = live.tx.send(Command::Show((w.text, w.buttons, w.waiting)));
+            live.seen = now;
+            if w.alive {
+                return;
             }
+            if std::mem::take(&mut live.part) {
+                live.written.drop_buttons(dc).await;
+                live.written = live.written.below();
+            }
+            live.latest = Some((w.text, w.buttons, w.waiting));
             return;
         }
         if w.alive {
             return;
         }
         if w.waiting && unopened_thread(&w.to) {
-            if !self.unopened.contains_key(&w.reply) {
-                if self.unopened.len() >= LIVE_KEPT {
-                    self.unopened.clear();
-                }
-                self.unopened.insert(w.reply.clone(), w.to.clone());
+            if self.unopened.insert(w.reply.clone()) {
                 self.typing.start(&w.to);
             }
             return;
         }
         self.unopened.remove(&w.reply);
+        let answers = w.in_reply_to.as_deref().and_then(parse_message_id);
+        let channel = match reply_channel(dc, &w.to, answers).await {
+            Ok(channel) => channel,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "discord: nowhere to show a reply being written");
+                self.end(w.reply);
+                return;
+            }
+        };
         stops().entry(w.reply.clone()).or_insert(Stop {
             to: w.to.clone(),
             pressed: HashMap::new(),
         });
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Command::Show((w.text, w.buttons, w.waiting)));
-        tokio::spawn(write_live(
-            dc.clone(),
-            w.reply.clone(),
-            w.to,
-            w.in_reply_to,
-            rx,
-        ));
         self.order.push_back(w.reply.clone());
         self.live.insert(
-            w.reply,
+            w.reply.clone(),
             Live {
-                tx,
-                seen: tokio::time::Instant::now(),
+                written: Written::new(
+                    &w.reply,
+                    channel,
+                    answers.and_then(|(c, m)| (c == channel).then_some(m)),
+                ),
+                latest: Some((w.text, w.buttons, w.waiting)),
+                next: now,
+                part: false,
+                seen: now,
             },
         );
         while self.order.len() > LIVE_KEPT {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
-            self.end(oldest);
+            let live = self.end(oldest);
+            Self::finish(dc, live).await;
         }
     }
 
     /// Show `o`, a part of a reply being written or its end, in that
-    /// reply's messages, by its task: whether it is; one that is not, or
-    /// whose reply is not shown (or had nowhere to go), goes as any other.
-    /// The end takes the buttons off; one with nothing to show takes the
-    /// bot's own messages of it down.
-    fn reply(&mut self, o: &ChannelOutbound) -> bool {
+    /// reply's messages: whether it was; one that is not, or whose reply
+    /// is not shown (or had nowhere to go), goes as any other. The end
+    /// takes the buttons off; one with nothing to show takes the bot's own
+    /// messages of it down.
+    async fn reply(&mut self, dc: &Discord, o: &ChannelOutbound) -> bool {
         let (Some(reply), ChannelMessageContent::Text { text }) = (&o.reply, &o.content) else {
             return false;
         };
@@ -2078,7 +2031,7 @@ impl Replies {
         }
         // One still waiting for text goes as any reply: it opens its thread
         // only when it has something to say.
-        let waited = self.unopened.remove(reply).is_some();
+        let waited = self.unopened.remove(reply);
         let Some(live) = self.live.get_mut(reply) else {
             if waited && !o.partial {
                 self.end(reply.clone());
@@ -2086,14 +2039,208 @@ impl Replies {
             return false;
         };
         live.seen = tokio::time::Instant::now();
-        let put = live.tx.send(Command::Put {
-            text: text.clone(),
-            partial: o.partial,
-        });
-        if !o.partial || put.is_err() {
+        live.latest = None;
+        if std::mem::take(&mut live.part) {
+            live.written.drop_buttons(dc).await;
+            live.written = live.written.below();
+        }
+        live.written.show(dc, text, o.partial, true).await;
+        live.written.waiting = false;
+        if o.partial {
+            live.part = true;
+        } else {
             self.end(reply.clone());
         }
-        put.is_ok()
+        true
+    }
+}
+
+/// Replies, and frames of replies being written, a conversation's worker
+/// holds at most; past that, frames of replies being written wait for the
+/// next.
+const CHAT_QUEUE: usize = 256;
+
+/// A worker that got nothing for this long ends; the next frame for its
+/// conversation starts another. Longer than [`LIVE_IDLE`], so it has no
+/// reply being written left.
+const CHAT_IDLE: Duration = Duration::from_secs(240);
+
+/// What a conversation's worker is given, in the order it came.
+enum Job {
+    Writing(types::ChannelWriting),
+    Outbound(Box<ChannelOutbound>),
+}
+
+/// Deliver what comes for conversation `to`, in the order it comes (havn
+/// issue #325): replies, the replies being written and their ends, files,
+/// buttons and notices. It alone opens the conversation's thread, and a
+/// rate limit holds up this conversation only. Each reply is marked
+/// delivered once it is. It ends when it is no longer given anything, its
+/// replies being written finished as they are.
+async fn chat_worker(
+    dc: Discord,
+    gateway: Gateway,
+    to: String,
+    mut rx: tokio::sync::mpsc::Receiver<Job>,
+    typing: Typing,
+    delivered: Arc<havn_ws::Delivered>,
+) {
+    use futures_util::FutureExt as _;
+    let mut replies = Replies::new(typing.clone());
+    let mut idle = tokio::time::interval(LIVE_IDLE_EVERY);
+    loop {
+        let due = replies.due();
+        // What came first: a reply is edited, or judged idle, only once the
+        // frames that came for it are taken.
+        let job = tokio::select! {
+            biased;
+            job = rx.recv() => job,
+            () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                let edited = std::panic::AssertUnwindSafe(replies.edit_due(&dc))
+                    .catch_unwind()
+                    .await;
+                if edited.is_err() {
+                    warn!("discord: editing a reply being written failed");
+                }
+                continue;
+            }
+            _ = idle.tick() => {
+                let finished = std::panic::AssertUnwindSafe(replies.idle(&dc))
+                    .catch_unwind()
+                    .await;
+                if finished.is_err() {
+                    warn!("discord: finishing an idle reply failed");
+                }
+                continue;
+            }
+        };
+        let Some(job) = job else {
+            for reply in replies.order.clone() {
+                let live = replies.end(reply);
+                Replies::finish(&dc, live).await;
+            }
+            return;
+        };
+        match job {
+            Job::Writing(w) => {
+                let taken = std::panic::AssertUnwindSafe(replies.writing(&dc, w))
+                    .catch_unwind()
+                    .await;
+                if taken.is_err() {
+                    warn!("discord: showing a reply being written failed");
+                }
+            }
+            Job::Outbound(o) => {
+                let shown = std::panic::AssertUnwindSafe(replies.reply(&dc, &o))
+                    .catch_unwind()
+                    .await;
+                // A part of a reply being written, or its end, takes the
+                // place of what was shown; any other goes as it is, as does
+                // one whose showing failed.
+                if !matches!(shown, Ok(true))
+                    && let Err(e) = deliver(&dc, &gateway, &o).await
+                {
+                    warn!(error = %format!("{e:#}"), seq = o.seq, "discord: a reply could not be delivered");
+                }
+                delivered.mark(o.seq);
+                if o.partial {
+                    typing.more(&to);
+                } else {
+                    typing.replied(&to);
+                }
+            }
+        }
+    }
+}
+
+/// The workers of the conversations replies go to, each with when it was
+/// last given something.
+struct Chats {
+    dc: Discord,
+    gateway: Gateway,
+    typing: Typing,
+    delivered: Arc<havn_ws::Delivered>,
+    workers: HashMap<String, (tokio::sync::mpsc::Sender<Job>, tokio::time::Instant)>,
+}
+
+impl Chats {
+    fn new(
+        dc: Discord,
+        gateway: Gateway,
+        typing: Typing,
+        delivered: Arc<havn_ws::Delivered>,
+    ) -> Self {
+        Self {
+            dc,
+            gateway,
+            typing,
+            delivered,
+            workers: HashMap::new(),
+        }
+    }
+
+    /// The worker of `to`, started when it has none.
+    fn worker(&mut self, to: &str) -> tokio::sync::mpsc::Sender<Job> {
+        let now = tokio::time::Instant::now();
+        if let Some((tx, used)) = self.workers.get_mut(to)
+            && !tx.is_closed()
+        {
+            *used = now;
+            return tx.clone();
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(CHAT_QUEUE);
+        tokio::spawn(chat_worker(
+            self.dc.clone(),
+            self.gateway.clone(),
+            to.to_string(),
+            rx,
+            self.typing.clone(),
+            Arc::clone(&self.delivered),
+        ));
+        self.workers.insert(to.to_string(), (tx.clone(), now));
+        tx
+    }
+
+    /// Hand `o` to its conversation's worker; one sent before a restart
+    /// (the gateway replays from an earlier reply of a slower conversation)
+    /// is not delivered again. It waits when the worker holds
+    /// [`CHAT_QUEUE`].
+    async fn outbound(&mut self, o: ChannelOutbound) {
+        if self.delivered.delivered_already(o.seq) {
+            self.delivered.mark(o.seq);
+            return;
+        }
+        self.delivered.handed(o.seq);
+        let seq = o.seq;
+        let to = o.to.clone();
+        if self
+            .worker(&to)
+            .send(Job::Outbound(Box::new(o)))
+            .await
+            .is_err()
+        {
+            warn!(
+                seq,
+                "discord: a conversation's worker is gone; dropping a reply"
+            );
+            self.delivered.mark(seq);
+        }
+    }
+
+    /// Hand `w` to its conversation's worker; when that holds
+    /// [`CHAT_QUEUE`], it is left out: the next frame of the reply, or its
+    /// end, shows it.
+    fn writing(&mut self, w: types::ChannelWriting) {
+        let to = w.to.clone();
+        let _ = self.worker(&to).try_send(Job::Writing(w));
+    }
+
+    /// Let the workers that got nothing for [`CHAT_IDLE`] end, once they
+    /// did what they hold.
+    fn idle(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.workers
+            .retain(|_, (tx, used)| !tx.is_closed() && now.duration_since(*used) < CHAT_IDLE);
     }
 }
 
@@ -2525,12 +2672,12 @@ mod tests {
             waiting: !alive,
             alive,
         };
-        replies.writing(&dc, writing(true));
-        replies.writing(&dc, writing(false));
-        replies.writing(&dc, writing(false));
+        replies.writing(&dc, writing(true)).await;
+        replies.writing(&dc, writing(false)).await;
+        replies.writing(&dc, writing(false)).await;
         // Typing in its place, once; no message, no thread opened.
         assert!(replies.live.is_empty());
-        assert!(replies.unopened.contains_key("m1"));
+        assert!(replies.unopened.contains("m1"));
         tokio::task::yield_now().await;
         assert_eq!(typed.lock().expect("lock").as_slice(), ["discord:t9911"]);
         assert!(unopened_thread("discord:t9911"));
@@ -2548,10 +2695,64 @@ mod tests {
             partial: false,
             reply: Some("m1".into()),
         };
-        assert!(!replies.reply(&end));
+        assert!(!replies.reply(&dc, &end).await);
         assert!(says_nothing(&end));
         assert!(replies.ended.contains(&"m1".to_string()));
         assert!(replies.unopened.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_conversation_has_one_worker_which_ends_when_idle() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dc = Discord::new(
+            Arc::new(twilight_http::Client::new("x".into())),
+            Id::new(1),
+            Id::new(2),
+        )
+        .expect("client");
+        let gateway = Gateway::new("ws://127.0.0.1:9", "t", "discord", "dc").expect("gateway");
+        let typing = Typing::new(|_| Box::pin(async {}));
+        let d = std::env::temp_dir().join(format!("havn-dc-chats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("dir");
+        let path = havn_ws::Delivered::file_in(&d, "dc");
+        // Before a restart, 7 was delivered while 6 waited in another one.
+        std::fs::write(&path, r#"{"account_id":"dc","seq":5,"done":[7]}"#).expect("file");
+        let delivered = Arc::new(havn_ws::Delivered::load(Some(path), "dc"));
+        let mut chats = Chats::new(dc, gateway, typing, delivered);
+        let reply = ChannelOutbound {
+            seq: 7,
+            account_id: "dc".into(),
+            to: "discord:t1".into(),
+            in_reply_to: None,
+            content: ChannelMessageContent::Text {
+                text: String::new(),
+            },
+            buttons: Vec::new(),
+            poll: None,
+            partial: false,
+            reply: None,
+        };
+        // Replayed as the gateway resumes from 5: 7 is not delivered again.
+        chats.outbound(reply).await;
+        assert!(chats.workers.is_empty());
+        let first = chats.worker("discord:t1");
+        assert!(
+            chats.worker("discord:t1").same_channel(&first),
+            "one per conversation"
+        );
+        assert!(!chats.worker("discord:c1").same_channel(&first));
+        let gone = first.downgrade();
+        drop(first);
+        tokio::time::advance(CHAT_IDLE + Duration::from_secs(1)).await;
+        chats.idle();
+        assert!(chats.workers.is_empty());
+        assert!(gone.upgrade().is_none(), "its worker is let go");
+        assert!(
+            !chats.worker("discord:t1").is_closed(),
+            "another for the next reply"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
