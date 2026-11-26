@@ -1377,21 +1377,9 @@ async fn havn_outbound_loop(
 ) -> Result<()> {
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
     // Each conversation's replies go through its own worker, in order (havn
-    // issue #325): a wait in one holds up no other.
-    let mut chats = Chats::new(dc.clone(), gateway, typing, delivered);
-    let mut idle = tokio::time::interval(LIVE_IDLE_EVERY);
-    loop {
-        let frame = tokio::select! {
-            biased;
-            frame = inbound_rx.recv() => frame,
-            _ = idle.tick() => {
-                chats.idle();
-                continue;
-            }
-        };
-        let Some(frame) = frame else {
-            break;
-        };
+    // issue #325): a wait in one holds up no other, nor this loop.
+    let chats = Chats::new(dc.clone(), gateway, typing, delivered);
+    while let Some(frame) = inbound_rx.recv().await {
         match frame {
             ChannelFrame::Commands(c) => {
                 GATEWAY_GROUPS.store(c.groups, Ordering::Relaxed);
@@ -1409,7 +1397,7 @@ async fn havn_outbound_loop(
                 }
             }
             ChannelFrame::Writing(w) => chats.writing(w),
-            ChannelFrame::Outbound(o) => chats.outbound(o).await,
+            ChannelFrame::Outbound(o) => chats.outbound(o),
             ChannelFrame::Pong => {}
             ChannelFrame::Inbound(_) | ChannelFrame::Resume(_) | ChannelFrame::Ping => {
                 debug!("dropping a frame the gateway does not send");
@@ -2055,71 +2043,176 @@ impl Replies {
     }
 }
 
-/// Replies, and frames of replies being written, a conversation's worker
-/// holds at most; past that, frames of replies being written wait for the
-/// next.
-const CHAT_QUEUE: usize = 256;
-
-/// A worker that got nothing for this long ends; the next frame for its
-/// conversation starts another. Longer than [`LIVE_IDLE`], so it has no
-/// reply being written left.
+/// A worker whose conversation had nothing for this long, with no reply
+/// being written left, ends; the next frame for it starts another.
 const CHAT_IDLE: Duration = Duration::from_secs(240);
 
-/// What a conversation's worker is given, in the order it came.
+/// What a conversation's worker is to do next.
 enum Job {
     Writing(types::ChannelWriting),
     Outbound(Box<ChannelOutbound>),
 }
 
+/// What waits for a conversation's worker, numbered as it came: the replies, and,
+/// of each reply being written, only its latest frame (numbered as the
+/// first of its frames not taken yet, so it is taken in its place).
+#[derive(Default)]
+struct Pending {
+    next: u64,
+    outbounds: std::collections::VecDeque<(u64, Box<ChannelOutbound>)>,
+    /// By reply and its part: the frames of a call after a part are not
+    /// taken in the place of those before it.
+    writings: HashMap<(String, u64), (u64, types::ChannelWriting)>,
+    /// The parts of each reply being written that wait.
+    parts: HashMap<String, u64>,
+}
+
+/// A conversation's frames on their way to its worker (havn issue #325). The router
+/// only adds to it, and never waits: the gateway bounds what it sends ahead
+/// of what the adapter took, and frames of replies being written take the
+/// place of their earlier ones.
+#[derive(Default)]
+struct Inbox {
+    pending: Mutex<Pending>,
+    added: tokio::sync::Notify,
+}
+
+impl Inbox {
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn outbound(&self, o: ChannelOutbound) {
+        {
+            let mut pending = self.pending();
+            let n = pending.next;
+            pending.next += 1;
+            if let Some(reply) = &o.reply {
+                if o.partial {
+                    *pending.parts.entry(reply.clone()).or_default() += 1;
+                } else {
+                    pending.parts.remove(reply);
+                }
+            }
+            pending.outbounds.push_back((n, Box::new(o)));
+        }
+        self.added.notify_one();
+    }
+
+    fn writing(&self, w: types::ChannelWriting) {
+        {
+            let mut pending = self.pending();
+            let n = pending.next;
+            pending.next += 1;
+            let key = (
+                w.reply.clone(),
+                pending.parts.get(&w.reply).copied().unwrap_or_default(),
+            );
+            match pending.writings.get_mut(&key) {
+                // Its latest, in the place of the first not taken; one that
+                // only says the reply is alive leaves text to show as it is.
+                Some((_, held)) => {
+                    if !w.alive || held.alive {
+                        *held = w;
+                    }
+                }
+                None => {
+                    pending.writings.insert(key, (n, w));
+                }
+            }
+        }
+        self.added.notify_one();
+    }
+
+    /// What came first of what waits.
+    fn take(&self) -> Option<Job> {
+        let mut pending = self.pending();
+        let writing = pending
+            .writings
+            .iter()
+            .min_by_key(|(_, (n, _))| *n)
+            .map(|(key, (n, _))| (key.clone(), *n));
+        let outbound = pending.outbounds.front().map(|(n, _)| *n);
+        match (writing, outbound) {
+            (Some((key, w)), o) if o.is_none_or(|o| w < o) => {
+                pending.writings.remove(&key).map(|(_, w)| Job::Writing(w))
+            }
+            (_, Some(_)) => pending.outbounds.pop_front().map(|(_, o)| Job::Outbound(o)),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        let pending = self.pending();
+        pending.outbounds.is_empty() && pending.writings.is_empty()
+    }
+}
+
+/// The inboxes of the conversations replies go to, each with a worker.
+type Inboxes = Arc<Mutex<HashMap<String, Arc<Inbox>>>>;
+
+fn inboxes(all: &Inboxes) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Inbox>>> {
+    all.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Deliver what comes for conversation `to`, in the order it comes (havn
 /// issue #325): replies, the replies being written and their ends, files,
-/// buttons and notices. It alone opens the conversation's thread, and a
-/// rate limit holds up this conversation only. Each reply is marked
-/// delivered once it is. It ends when it is no longer given anything, its
-/// replies being written finished as they are.
+/// buttons and notices. It alone opens the conversation's thread. A rate
+/// limit holds up this conversation only, and a failure in one, a panic
+/// included, only that one. Each reply is marked delivered once it is. It
+/// ends, its inbox let go with it, when its conversation had nothing for
+/// [`CHAT_IDLE`] and no reply is being written there.
 async fn chat_worker(
     dc: Discord,
     gateway: Gateway,
     to: String,
-    mut rx: tokio::sync::mpsc::Receiver<Job>,
+    inbox: Arc<Inbox>,
+    all: Inboxes,
     typing: Typing,
     delivered: Arc<havn_ws::Delivered>,
 ) {
     use futures_util::FutureExt as _;
     let mut replies = Replies::new(typing.clone());
     let mut idle = tokio::time::interval(LIVE_IDLE_EVERY);
+    let mut last = tokio::time::Instant::now();
     loop {
-        let due = replies.due();
-        // What came first: a reply is edited, or judged idle, only once the
-        // frames that came for it are taken.
-        let job = tokio::select! {
-            biased;
-            job = rx.recv() => job,
-            () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
-                let edited = std::panic::AssertUnwindSafe(replies.edit_due(&dc))
-                    .catch_unwind()
-                    .await;
-                if edited.is_err() {
-                    warn!("discord: editing a reply being written failed");
+        let Some(job) = inbox.take() else {
+            let due = replies.due();
+            tokio::select! {
+                biased;
+                () = inbox.added.notified() => {}
+                () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                    let edited = std::panic::AssertUnwindSafe(replies.edit_due(&dc))
+                        .catch_unwind()
+                        .await;
+                    if edited.is_err() {
+                        tracing::error!("discord: editing a reply being written panicked");
+                    }
                 }
-                continue;
-            }
-            _ = idle.tick() => {
-                let finished = std::panic::AssertUnwindSafe(replies.idle(&dc))
-                    .catch_unwind()
-                    .await;
-                if finished.is_err() {
-                    warn!("discord: finishing an idle reply failed");
+                _ = idle.tick() => {
+                    let finished = std::panic::AssertUnwindSafe(replies.idle(&dc))
+                        .catch_unwind()
+                        .await;
+                    if finished.is_err() {
+                        tracing::error!("discord: finishing an idle reply panicked");
+                    }
+                    if replies.live.is_empty() && last.elapsed() >= CHAT_IDLE {
+                        // With the router's lock: it adds to this inbox, or
+                        // starts another worker, not both.
+                        let mut map = inboxes(&all);
+                        if inbox.is_empty() {
+                            if map.get(&to).is_some_and(|i| Arc::ptr_eq(i, &inbox)) {
+                                map.remove(&to);
+                            }
+                            return;
+                        }
+                    }
                 }
-                continue;
             }
-        };
-        let Some(job) = job else {
-            for reply in replies.order.clone() {
-                let live = replies.end(reply);
-                Replies::finish(&dc, live).await;
-            }
-            return;
+            continue;
         };
         match job {
             Job::Writing(w) => {
@@ -2127,7 +2220,7 @@ async fn chat_worker(
                     .catch_unwind()
                     .await;
                 if taken.is_err() {
-                    warn!("discord: showing a reply being written failed");
+                    tracing::error!("discord: showing a reply being written panicked");
                 }
             }
             Job::Outbound(o) => {
@@ -2137,10 +2230,20 @@ async fn chat_worker(
                 // A part of a reply being written, or its end, takes the
                 // place of what was shown; any other goes as it is, as does
                 // one whose showing failed.
-                if !matches!(shown, Ok(true))
-                    && let Err(e) = deliver(&dc, &gateway, &o).await
-                {
-                    warn!(error = %format!("{e:#}"), seq = o.seq, "discord: a reply could not be delivered");
+                if !matches!(shown, Ok(true)) {
+                    let sent = std::panic::AssertUnwindSafe(deliver(&dc, &gateway, &o))
+                        .catch_unwind()
+                        .await;
+                    match sent {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(error = %format!("{e:#}"), seq = o.seq, "discord: a reply could not be delivered");
+                        }
+                        Err(_) => tracing::error!(
+                            seq = o.seq,
+                            "discord: delivering a reply panicked; dropping it"
+                        ),
+                    }
                 }
                 delivered.mark(o.seq);
                 if o.partial {
@@ -2150,17 +2253,17 @@ async fn chat_worker(
                 }
             }
         }
+        last = tokio::time::Instant::now();
     }
 }
 
-/// The workers of the conversations replies go to, each with when it was
-/// last given something.
+/// Where replies go: each conversation's inbox, and its worker.
 struct Chats {
     dc: Discord,
     gateway: Gateway,
     typing: Typing,
     delivered: Arc<havn_ws::Delivered>,
-    workers: HashMap<String, (tokio::sync::mpsc::Sender<Job>, tokio::time::Instant)>,
+    inboxes: Inboxes,
 }
 
 impl Chats {
@@ -2175,72 +2278,48 @@ impl Chats {
             gateway,
             typing,
             delivered,
-            workers: HashMap::new(),
+            inboxes: Inboxes::default(),
         }
     }
 
-    /// The worker of `to`, started when it has none.
-    fn worker(&mut self, to: &str) -> tokio::sync::mpsc::Sender<Job> {
-        let now = tokio::time::Instant::now();
-        if let Some((tx, used)) = self.workers.get_mut(to)
-            && !tx.is_closed()
-        {
-            *used = now;
-            return tx.clone();
-        }
-        let (tx, rx) = tokio::sync::mpsc::channel(CHAT_QUEUE);
-        tokio::spawn(chat_worker(
-            self.dc.clone(),
-            self.gateway.clone(),
-            to.to_string(),
-            rx,
-            self.typing.clone(),
-            Arc::clone(&self.delivered),
-        ));
-        self.workers.insert(to.to_string(), (tx.clone(), now));
-        tx
+    /// Add to the inbox of `to`, with a worker started when it has none,
+    /// under the lock a worker ends with.
+    fn add(&self, to: &str, add: impl FnOnce(&Inbox)) {
+        let mut map = inboxes(&self.inboxes);
+        let inbox = map.entry(to.to_string()).or_insert_with(|| {
+            let inbox = Arc::new(Inbox::default());
+            tokio::spawn(chat_worker(
+                self.dc.clone(),
+                self.gateway.clone(),
+                to.to_string(),
+                Arc::clone(&inbox),
+                Arc::clone(&self.inboxes),
+                self.typing.clone(),
+                Arc::clone(&self.delivered),
+            ));
+            inbox
+        });
+        add(inbox);
     }
 
-    /// Hand `o` to its conversation's worker; one sent before a restart
-    /// (the gateway replays from an earlier reply of a slower conversation)
-    /// is not delivered again. It waits when the worker holds
-    /// [`CHAT_QUEUE`].
-    async fn outbound(&mut self, o: ChannelOutbound) {
+    /// Hand `o` to its conversation's worker, without waiting; one sent
+    /// before a restart (the gateway replays from an earlier reply of a
+    /// slower conversation) is not delivered again.
+    fn outbound(&self, o: ChannelOutbound) {
         if self.delivered.delivered_already(o.seq) {
             self.delivered.mark(o.seq);
             return;
         }
         self.delivered.handed(o.seq);
-        let seq = o.seq;
         let to = o.to.clone();
-        if self
-            .worker(&to)
-            .send(Job::Outbound(Box::new(o)))
-            .await
-            .is_err()
-        {
-            warn!(
-                seq,
-                "discord: a conversation's worker is gone; dropping a reply"
-            );
-            self.delivered.mark(seq);
-        }
+        self.add(&to, |inbox| inbox.outbound(o));
     }
 
-    /// Hand `w` to its conversation's worker; when that holds
-    /// [`CHAT_QUEUE`], it is left out: the next frame of the reply, or its
-    /// end, shows it.
-    fn writing(&mut self, w: types::ChannelWriting) {
+    /// Hand `w` to its conversation's worker, in the place of the reply's
+    /// earlier frame it has not taken yet.
+    fn writing(&self, w: types::ChannelWriting) {
         let to = w.to.clone();
-        let _ = self.worker(&to).try_send(Job::Writing(w));
-    }
-
-    /// Let the workers that got nothing for [`CHAT_IDLE`] end, once they
-    /// did what they hold.
-    fn idle(&mut self) {
-        let now = tokio::time::Instant::now();
-        self.workers
-            .retain(|_, (tx, used)| !tx.is_closed() && now.duration_since(*used) < CHAT_IDLE);
+        self.add(&to, |inbox| inbox.writing(w));
     }
 }
 
@@ -2701,8 +2780,53 @@ mod tests {
         assert!(replies.unopened.is_empty());
     }
 
+    #[test]
+    fn a_conversation_inbox_keeps_the_order_and_only_the_latest_text_of_a_call() {
+        let writing = |text: &str, alive: bool| types::ChannelWriting {
+            account_id: "dc".into(),
+            to: "discord:t1".into(),
+            in_reply_to: None,
+            reply: "r1".into(),
+            text: text.into(),
+            buttons: Vec::new(),
+            waiting: false,
+            alive,
+        };
+        let outbound = |seq: u64, partial: bool, reply: Option<&str>| ChannelOutbound {
+            seq,
+            account_id: "dc".into(),
+            to: "discord:t1".into(),
+            in_reply_to: None,
+            content: ChannelMessageContent::Text {
+                text: String::new(),
+            },
+            buttons: Vec::new(),
+            poll: None,
+            partial,
+            reply: reply.map(Into::into),
+        };
+        let inbox = Inbox::default();
+        inbox.outbound(outbound(1, false, None));
+        inbox.writing(writing("a", false));
+        inbox.writing(writing("ab", false));
+        inbox.writing(writing("", true));
+        inbox.outbound(outbound(2, true, Some("r1")));
+        // The call after the part is its own, and comes after it.
+        inbox.writing(writing("c", false));
+        inbox.writing(writing("cd", false));
+        inbox.outbound(outbound(3, false, Some("r1")));
+        let taken: Vec<String> = std::iter::from_fn(|| inbox.take())
+            .map(|job| match job {
+                Job::Writing(w) => format!("w:{}", w.text),
+                Job::Outbound(o) => format!("o:{}", o.seq),
+            })
+            .collect();
+        assert_eq!(taken, ["o:1", "w:ab", "o:2", "w:cd", "o:3"]);
+        assert!(inbox.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn each_conversation_has_one_worker_which_ends_when_idle() {
+    async fn each_conversation_has_one_worker_which_ends_once_it_is_quiet() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let dc = Discord::new(
             Arc::new(twilight_http::Client::new("x".into())),
@@ -2719,9 +2843,9 @@ mod tests {
         // Before a restart, 7 was delivered while 6 waited in another one.
         std::fs::write(&path, r#"{"account_id":"dc","seq":5,"done":[7]}"#).expect("file");
         let delivered = Arc::new(havn_ws::Delivered::load(Some(path), "dc"));
-        let mut chats = Chats::new(dc, gateway, typing, delivered);
-        let reply = ChannelOutbound {
-            seq: 7,
+        let chats = Chats::new(dc, gateway, typing, delivered);
+        let reply = |seq: u64| ChannelOutbound {
+            seq,
             account_id: "dc".into(),
             to: "discord:t1".into(),
             in_reply_to: None,
@@ -2734,23 +2858,26 @@ mod tests {
             reply: None,
         };
         // Replayed as the gateway resumes from 5: 7 is not delivered again.
-        chats.outbound(reply).await;
-        assert!(chats.workers.is_empty());
-        let first = chats.worker("discord:t1");
+        chats.outbound(reply(7));
+        assert!(inboxes(&chats.inboxes).is_empty());
+        // Handed without waiting, however many.
+        for seq in 8..2000 {
+            chats.outbound(reply(seq));
+        }
+        let first = Arc::clone(&inboxes(&chats.inboxes)["discord:t1"]);
+        chats.outbound(reply(2000));
         assert!(
-            chats.worker("discord:t1").same_channel(&first),
+            Arc::ptr_eq(&first, &inboxes(&chats.inboxes)["discord:t1"]),
             "one per conversation"
         );
-        assert!(!chats.worker("discord:c1").same_channel(&first));
-        let gone = first.downgrade();
-        drop(first);
-        tokio::time::advance(CHAT_IDLE + Duration::from_secs(1)).await;
-        chats.idle();
-        assert!(chats.workers.is_empty());
-        assert!(gone.upgrade().is_none(), "its worker is let go");
+        // It delivers what it holds, and ends only once it is quiet.
+        tokio::time::sleep(CHAT_IDLE + LIVE_IDLE_EVERY * 2).await;
+        assert!(first.is_empty());
+        assert!(inboxes(&chats.inboxes).is_empty(), "let go once quiet");
+        chats.outbound(reply(2001));
         assert!(
-            !chats.worker("discord:t1").is_closed(),
-            "another for the next reply"
+            !Arc::ptr_eq(&first, &inboxes(&chats.inboxes)["discord:t1"]),
+            "another for the next"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
