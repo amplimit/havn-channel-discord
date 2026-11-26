@@ -66,6 +66,23 @@ fn bad_request(e: &twilight_http::Error) -> bool {
     )
 }
 
+/// How long Discord asks the bot to wait, when `e` is it saying the bot is
+/// rate limited, at most a minute.
+pub fn slow_down(e: &anyhow::Error) -> Option<Duration> {
+    match e.downcast_ref::<twilight_http::Error>()?.kind() {
+        twilight_http::error::ErrorType::Response {
+            error: twilight_http::api_error::ApiError::Ratelimited(limited),
+            ..
+        } => Some(Duration::from_secs_f64(
+            limited.retry_after.clamp(0.1, 60.0),
+        )),
+        twilight_http::error::ErrorType::Response { status, .. } if status.get() == 429 => {
+            Some(Duration::from_secs(1))
+        }
+        _ => None,
+    }
+}
+
 /// Discord's error code of a failed request, if it gave one.
 pub fn api_code(e: &twilight_http::Error) -> Option<u64> {
     match e.kind() {
@@ -250,14 +267,6 @@ impl Discord {
             .await
             .context("editing a message")?;
         Ok(())
-    }
-
-    /// Delete thread `thread`, one the bot opened. Best-effort: Discord
-    /// lets a bot do it only with the Manage Threads permission.
-    pub async fn delete_thread(&self, thread: Id<ChannelMarker>) {
-        if let Err(e) = self.http.delete_channel(thread).await {
-            tracing::debug!(error = %e, "discord: a thread could not be deleted");
-        }
     }
 
     /// Delete the bot's message `id`. Best-effort.
