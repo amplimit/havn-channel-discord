@@ -1,5 +1,6 @@
 //! Discord's REST side, over twilight-http: sending text, files and
-//! components, opening threads and private channels, the typing
+//! components, editing and deleting the messages of a reply being
+//! written, opening threads and private channels, the typing
 //! indicator, the command menu, answers to interactions, and fetching
 //! what people attach. No mention in what the bot sends pings anyone.
 
@@ -63,6 +64,23 @@ fn bad_request(e: &twilight_http::Error) -> bool {
         e.kind(),
         twilight_http::error::ErrorType::Response { status, .. } if status.get() == 400
     )
+}
+
+/// How long Discord asks the bot to wait, when `e` is it saying the bot is
+/// rate limited, at most a minute.
+pub fn slow_down(e: &anyhow::Error) -> Option<Duration> {
+    match e.downcast_ref::<twilight_http::Error>()?.kind() {
+        twilight_http::error::ErrorType::Response {
+            error: twilight_http::api_error::ApiError::Ratelimited(limited),
+            ..
+        } => Some(Duration::from_secs_f64(
+            limited.retry_after.clamp(0.1, 60.0),
+        )),
+        twilight_http::error::ErrorType::Response { status, .. } if status.get() == 429 => {
+            Some(Duration::from_secs(1))
+        }
+        _ => None,
+    }
 }
 
 /// Discord's error code of a failed request, if it gave one.
@@ -184,6 +202,78 @@ impl Discord {
             }
         }
         Ok(())
+    }
+
+    /// Send `part`, text of one message, to `channel`, a reply to `reply`,
+    /// with `components` under it (when Discord refuses them, the text
+    /// goes alone): its id.
+    pub async fn send_part(
+        &self,
+        channel: Id<ChannelMarker>,
+        part: &str,
+        reply: Option<Id<MessageMarker>>,
+        components: &[Component],
+    ) -> Result<Id<MessageMarker>> {
+        let mentions = silent();
+        let mut sent = None;
+        for under in [components, &[]] {
+            let mut request = self
+                .http
+                .create_message(channel)
+                .content(part)
+                .allowed_mentions(Some(&mentions));
+            if let Some(reply) = reply {
+                request = request.reply(reply).fail_if_not_exists(false);
+            }
+            if !under.is_empty() {
+                request = request.components(under);
+            }
+            match request.await {
+                Err(e) if !under.is_empty() && bad_request(&e) => {
+                    tracing::warn!(error = %e, "discord refused the buttons; sending the text alone");
+                }
+                done => {
+                    sent = Some(done);
+                    break;
+                }
+            }
+        }
+        let Some(sent) = sent else {
+            bail!("sending a message: nothing was sent");
+        };
+        let message = sent
+            .context("sending a message")?
+            .model()
+            .await
+            .context("reading the message sent")?;
+        Ok(message.id)
+    }
+
+    /// Show `part` in message `id` instead, with `components` under it
+    /// (none takes them off).
+    pub async fn edit_part(
+        &self,
+        channel: Id<ChannelMarker>,
+        id: Id<MessageMarker>,
+        part: &str,
+        components: &[Component],
+    ) -> Result<()> {
+        let mentions = silent();
+        self.http
+            .update_message(channel, id)
+            .content(Some(part))
+            .components(Some(components))
+            .allowed_mentions(Some(&mentions))
+            .await
+            .context("editing a message")?;
+        Ok(())
+    }
+
+    /// Delete the bot's message `id`. Best-effort.
+    pub async fn delete(&self, channel: Id<ChannelMarker>, id: Id<MessageMarker>) {
+        if let Err(e) = self.http.delete_message(channel, id).await {
+            tracing::debug!(error = %e, "discord: a message could not be deleted");
+        }
     }
 
     /// Send file `filename` to `channel`, with `caption` (its first part;
