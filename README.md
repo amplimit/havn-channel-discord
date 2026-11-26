@@ -66,7 +66,7 @@ havn credential add channel:discord "$ADAPTER_TOKEN" --name acme-discord
 ### 4. Install the daemon
 
 ```bash
-VERSION=0.2.11
+VERSION=0.2.15
 asset="havn-channel-discord-$(uname -m)-unknown-linux-musl.tar.gz"
 base="https://github.com/amplimit/havn-channel-discord/releases/download/v$VERSION"
 curl -fL -O "$base/$asset" -O "$base/$asset.sha256"
