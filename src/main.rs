@@ -2933,7 +2933,7 @@ mod tests {
         .expect("client");
         let gateway = Gateway::new("ws://127.0.0.1:9", "t", "discord", "dc").expect("gateway");
         let typing = Typing::new(|_| Box::pin(async {}));
-        let d = std::env::temp_dir().join(format!("havn-dc-chats-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("havn-dc-workers-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("dir");
         let path = havn_ws::Delivered::file_in(&d, "dc");
