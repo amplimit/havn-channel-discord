@@ -874,8 +874,8 @@ async fn on_message(ctx: &Ctx, message: &Message) {
         return;
     }
     // In a server a message may get no reply (a channel not let in), so
-    // typing shows only in private chats.
-    if group.is_none() {
+    // typing shows only in private chats; a `/stop` gets none either.
+    if group.is_none() && !is_stop(&said) {
         ctx.typing.start(&to);
     }
     send_inbound(
@@ -1025,6 +1025,25 @@ fn parse_interaction(interaction: &Interaction) -> Option<(Asked, InteractionRes
     }
 }
 
+/// Whether `text` is `/stop` as the gateway takes it (`/stop`, `/STOP`,
+/// `/stop@bot`), with nothing after it: it stops a reply and gets none of
+/// its own, so no typing indicator shows for it.
+fn is_stop(text: &str) -> bool {
+    let Some(head) = text.trim().strip_prefix('/') else {
+        return false;
+    };
+    let name = match head.split_once('@') {
+        Some((name, bot))
+            if !bot.is_empty() && bot.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+        {
+            name
+        }
+        Some(_) => return false,
+        None => head,
+    };
+    name.eq_ignore_ascii_case("stop")
+}
+
 /// A slash command, a button pressed or a choice made, on to the gateway
 /// as text from the person who used it. Discord is answered first, as it
 /// waits 3 seconds at most.
@@ -1108,8 +1127,9 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
             (Some(group), to)
         }
     };
-    // A Stop gets no reply of its own, so no typing shows.
-    if group.is_none() && stopped.is_none() {
+    // A Stop, pressed or typed, gets no reply of its own, so no typing
+    // shows.
+    if group.is_none() && stopped.is_none() && !is_stop(&said) {
         ctx.typing.start(&to);
     }
     send_inbound(
@@ -2957,6 +2977,32 @@ mod tests {
             "another for the next"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_typed_stop_is_told_apart_as_the_gateway_takes_it() {
+        for stop in [
+            "/stop",
+            " /stop ",
+            "/STOP",
+            "/Stop@acme_bot",
+            "/stop@Acme_Bot",
+        ] {
+            assert!(is_stop(stop), "{stop}");
+        }
+        // Not a stop, or one the gateway answers (it takes nothing after it).
+        for other in [
+            "stop",
+            "/stopped",
+            "/stop now",
+            "/stop@",
+            "/stop@a-b",
+            "/new",
+            "/ stop",
+            "",
+        ] {
+            assert!(!is_stop(other), "{other}");
+        }
     }
 
     #[test]
