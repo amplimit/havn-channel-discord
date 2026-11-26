@@ -1310,8 +1310,9 @@ async fn reply_channel(
     }
 }
 
-/// havn to Discord: each reply is delivered, the menu set from the
-/// gateway's commands.
+/// havn to Discord: each reply is delivered, or shown in the messages of
+/// the reply being written it ends ([`Replies`]), each reply being written
+/// shown there, and the menu set from the gateway's commands.
 async fn havn_outbound_loop(
     dc: Discord,
     gateway: Gateway,
@@ -1320,6 +1321,7 @@ async fn havn_outbound_loop(
     delivered: Arc<havn_ws::Delivered>,
 ) -> Result<()> {
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
+    let mut replies = Replies::default();
     while let Some(frame) = inbound_rx.recv().await {
         match frame {
             ChannelFrame::Commands(c) => {
@@ -1337,8 +1339,13 @@ async fn havn_outbound_loop(
                     }
                 }
             }
+            ChannelFrame::Writing(w) => replies.writing(&dc, w).await,
             ChannelFrame::Outbound(o) => {
-                if let Err(e) = deliver(&dc, &gateway, &o).await {
+                // A part of a reply being written, or its end, takes the
+                // place of what was shown; any other goes as it is.
+                if !replies.reply(&dc, &o).await
+                    && let Err(e) = deliver(&dc, &gateway, &o).await
+                {
                     warn!(error = %format!("{e:#}"), seq = o.seq, "discord: a reply could not be delivered");
                 }
                 delivered.mark(o.seq);
@@ -1440,6 +1447,275 @@ async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result
     };
     dc.send_text(channel, &text, reply, &button_rows(&o.buttons))
         .await
+}
+
+/// How often a reply being written is edited, at most (havn issue #325):
+/// Discord lets a bot edit about five times in five seconds in a channel.
+const LIVE_EVERY: Duration = Duration::from_millis(1500);
+/// Replies being written that are kept at most; past that, the oldest is
+/// let go as it is (one whose end never came).
+const LIVE_KEPT: usize = 256;
+
+/// One message of a reply being written: its id, its text, and whether it
+/// has the buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shown {
+    id: Id<MessageMarker>,
+    text: String,
+    buttons: bool,
+}
+
+/// What changes a reply's messages from `shown` to `parts`, the buttons
+/// under the last when `buttons`.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    Edit(usize),
+    Send(usize),
+    Delete(usize),
+}
+
+/// The changes, in order: messages whose text or buttons differ edited,
+/// parts past them sent, messages past the parts deleted, the last first.
+fn changes(shown: &[Shown], parts: &[String], buttons: bool) -> Vec<Change> {
+    let mut changes = Vec::new();
+    for (n, part) in parts.iter().enumerate() {
+        let under = buttons && n + 1 == parts.len();
+        match shown.get(n) {
+            Some(s) if s.text == *part && s.buttons == under => {}
+            Some(_) => changes.push(Change::Edit(n)),
+            None => changes.push(Change::Send(n)),
+        }
+    }
+    changes.extend((parts.len()..shown.len()).rev().map(Change::Delete));
+    changes
+}
+
+/// The messages a reply being written is shown in (havn issue #325).
+#[derive(Debug)]
+struct Written {
+    channel: Id<ChannelMarker>,
+    /// What its first message answers.
+    reply: Option<Id<MessageMarker>>,
+    messages: Vec<Shown>,
+    /// What it was last given to show under its last message.
+    buttons: Vec<Vec<types::Button>>,
+}
+
+impl Written {
+    fn new(channel: Id<ChannelMarker>, reply: Option<Id<MessageMarker>>) -> Self {
+        Self {
+            channel,
+            reply,
+            messages: Vec::new(),
+            buttons: Vec::new(),
+        }
+    }
+
+    /// Show `text` in its messages, `buttons` under the last: those that
+    /// change are edited, those past them sent, those no longer needed
+    /// deleted. A message that cannot be changed is left as it was.
+    async fn show(&mut self, dc: &Discord, text: &str, buttons: &[Vec<types::Button>]) {
+        let parts = text::split(text);
+        let rows = button_rows(buttons);
+        let under = !rows.is_empty();
+        for change in changes(&self.messages, &parts, under) {
+            match change {
+                Change::Delete(n) => {
+                    dc.delete(self.channel, self.messages[n].id).await;
+                    self.messages.truncate(n);
+                }
+                Change::Edit(n) | Change::Send(n) => {
+                    let with = under && n + 1 == parts.len();
+                    let components: &[Component] = if with { &rows } else { &[] };
+                    let put = if let Some(old) = self.messages.get(n) {
+                        dc.edit_part(self.channel, old.id, &parts[n], components)
+                            .await
+                            .map(|()| old.id)
+                    } else {
+                        let reply = if n == 0 { self.reply } else { None };
+                        dc.send_part(self.channel, &parts[n], reply, components)
+                            .await
+                    };
+                    match put {
+                        Ok(id) => {
+                            let shown = Shown {
+                                id,
+                                text: parts[n].clone(),
+                                buttons: with,
+                            };
+                            match self.messages.get_mut(n) {
+                                Some(old) => *old = shown,
+                                None => self.messages.push(shown),
+                            }
+                        }
+                        Err(e) if n < self.messages.len() => {
+                            debug!(error = %format!("{e:#}"), "discord: a reply being written could not be edited");
+                        }
+                        // The next ones would come out of order.
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), "discord: a reply being written could not be sent");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take the buttons off its last message.
+    async fn drop_buttons(&mut self, dc: &Discord) {
+        if let Some(last) = self.messages.last_mut()
+            && last.buttons
+        {
+            if let Err(e) = dc.edit_part(self.channel, last.id, &last.text, &[]).await {
+                debug!(error = %format!("{e:#}"), "discord: the buttons could not be taken off");
+            }
+            last.buttons = false;
+        }
+    }
+}
+
+/// What a reply being written is to show: its text and its buttons.
+type Showing = (String, Vec<Vec<types::Button>>);
+
+/// Edit `written` to show what `rx` is given, at most every
+/// [`LIVE_EVERY`], until its sender goes: then what it shows.
+async fn write_live(
+    dc: Discord,
+    mut written: Written,
+    mut rx: tokio::sync::watch::Receiver<Showing>,
+) -> Written {
+    loop {
+        let (text, buttons) = rx.borrow_and_update().clone();
+        written.buttons.clone_from(&buttons);
+        written.show(&dc, &text, &buttons).await;
+        let until = tokio::time::Instant::now() + LIVE_EVERY;
+        if rx.changed().await.is_err() {
+            return written;
+        }
+        let rest = tokio::time::sleep_until(until);
+        tokio::pin!(rest);
+        loop {
+            tokio::select! {
+                () = &mut rest => break,
+                changed = rx.changed() => if changed.is_err() {
+                    return written;
+                },
+            }
+        }
+    }
+}
+
+/// A reply being written (havn issue #325).
+enum Live {
+    /// Its model call's text, shown by a task as it comes.
+    Writing {
+        tx: tokio::sync::watch::Sender<Showing>,
+        task: tokio::task::JoinHandle<Written>,
+    },
+    /// A part of it, with more to come: what is written next is shown in
+    /// messages below it.
+    Part(Written),
+}
+
+/// The replies being written, by the gateway's id, oldest first.
+#[derive(Default)]
+struct Replies {
+    live: HashMap<String, Live>,
+    order: VecDeque<String>,
+}
+
+impl Replies {
+    fn put(&mut self, reply: String, live: Live) {
+        self.order.retain(|r| *r != reply);
+        self.order.push_back(reply.clone());
+        self.live.insert(reply, live);
+        while self.order.len() > LIVE_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.live.remove(&oldest);
+            }
+        }
+    }
+
+    fn take(&mut self, reply: &str) -> Option<Live> {
+        self.order.retain(|r| r != reply);
+        self.live.remove(reply)
+    }
+
+    /// Show `w`: in its reply's messages, or in new ones (below a part of
+    /// it shown, which loses its buttons), where its reply goes (a thread
+    /// waiting to be opened is opened).
+    async fn writing(&mut self, dc: &Discord, w: types::ChannelWriting) {
+        let showing = (w.text, w.buttons);
+        if let Some(Live::Writing { tx, .. }) = self.live.get(&w.reply) {
+            let _ = tx.send(showing);
+            return;
+        }
+        let written = if let Some(Live::Part(mut part)) = self.take(&w.reply) {
+            part.drop_buttons(dc).await;
+            Written::new(part.channel, None)
+        } else {
+            let answers = w.in_reply_to.as_deref().and_then(parse_message_id);
+            let channel = match reply_channel(dc, &w.to, answers).await {
+                Ok(channel) => channel,
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "discord: nowhere to show a reply being written");
+                    return;
+                }
+            };
+            Written::new(
+                channel,
+                answers.and_then(|(c, m)| (c == channel).then_some(m)),
+            )
+        };
+        let (tx, rx) = tokio::sync::watch::channel(showing);
+        let task = tokio::spawn(write_live(dc.clone(), written, rx));
+        self.put(w.reply, Live::Writing { tx, task });
+    }
+
+    /// Show `o`, a part of a reply being written or its end, in that
+    /// reply's messages: whether it was; one that is not, or whose reply
+    /// is not shown, goes as any other. The end takes the buttons off.
+    async fn reply(&mut self, dc: &Discord, o: &ChannelOutbound) -> bool {
+        let (Some(reply), ChannelMessageContent::Text { text }) = (&o.reply, &o.content) else {
+            return false;
+        };
+        if !o.buttons.is_empty() || o.poll.is_some() {
+            return false;
+        }
+        let Some(live) = self.take(reply) else {
+            return false;
+        };
+        let mut written = match live {
+            Live::Writing { tx, task } => {
+                drop(tx);
+                match task.await {
+                    Ok(written) => written,
+                    Err(_) => return false,
+                }
+            }
+            // A part shown already: what follows goes below it.
+            Live::Part(mut part) => {
+                part.drop_buttons(dc).await;
+                if !o.partial {
+                    return false;
+                }
+                let mut below = Written::new(part.channel, None);
+                below.buttons = part.buttons;
+                below
+            }
+        };
+        let buttons = if o.partial {
+            written.buttons.clone()
+        } else {
+            Vec::new()
+        };
+        written.show(dc, text, &buttons).await;
+        if o.partial {
+            self.put(reply.clone(), Live::Part(written));
+        }
+        true
+    }
 }
 
 /// Why a file was not sent, for the person.
@@ -1735,6 +2011,58 @@ mod tests {
         assert!(m.get(0).is_none() && m.get(2).is_none());
         assert_eq!(m.take(3), Some(3));
         assert!(m.take(3).is_none());
+    }
+
+    #[test]
+    fn a_reply_being_written_changes_only_what_differs() {
+        let shown = |id: u64, text: &str, buttons: bool| Shown {
+            id: Id::new(id),
+            text: text.into(),
+            buttons,
+        };
+        let parts = |texts: &[&str]| texts.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+        // The first text, then more of it: the message is edited.
+        assert_eq!(changes(&[], &parts(&["a"]), true), vec![Change::Send(0)]);
+        let one = [shown(1, "a", true)];
+        assert_eq!(changes(&one, &parts(&["a"]), true), Vec::new());
+        assert_eq!(changes(&one, &parts(&["ab"]), true), vec![Change::Edit(0)]);
+        // Past one message, the next is sent and the buttons move to it.
+        assert_eq!(
+            changes(&one, &parts(&["a", "b"]), true),
+            vec![Change::Edit(0), Change::Send(1)]
+        );
+        // The end takes the buttons off; what is no longer needed goes.
+        let two = [shown(1, "a", false), shown(2, "b", true)];
+        assert_eq!(
+            changes(&two, &parts(&["a", "b"]), false),
+            vec![Change::Edit(1)]
+        );
+        assert_eq!(
+            changes(&two, &[], false),
+            vec![Change::Delete(1), Change::Delete(0)]
+        );
+        // A long reply goes on in the next message.
+        let long = text::split(&"word ".repeat(1000));
+        assert!(long.len() >= 3, "{}", long.len());
+        assert_eq!(
+            changes(&[], &long, true),
+            (0..long.len()).map(Change::Send).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_stop_button_is_a_button_discord_takes() {
+        let rows = button_rows(&[vec![types::Button {
+            label: "Stop".into(),
+            data: "/stop".into(),
+        }]]);
+        assert_eq!(rows.len(), 1);
+        let Component::ActionRow(row) = &rows[0] else {
+            panic!("not a row");
+        };
+        assert!(
+            matches!(&row.components[0], Component::Button(b) if b.custom_id.as_deref() == Some("/stop"))
+        );
     }
 
     #[tokio::test(start_paused = true)]
