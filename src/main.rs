@@ -1070,6 +1070,22 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
             format!("{answer_text} {numbers}")
         }
     };
+    // A Stop button (havn issue #325) stops its reply's conversation,
+    // wherever the reply went, once, while it is being written; after, it
+    // only comes off.
+    let stopped = match stop_of(&said) {
+        Pressed::Stop(to) => Some(to),
+        Pressed::Spent => {
+            answer(response).await;
+            return;
+        }
+        Pressed::Other => None,
+    };
+    let said = if stopped.is_some() {
+        "/stop".to_string()
+    } else {
+        said
+    };
     answer(response).await;
     let sender = user_id(user.id);
     let (group, to) = match interaction.guild_id {
@@ -1088,11 +1104,19 @@ async fn on_interaction(ctx: &Ctx, interaction: &Interaction) {
                 .and_then(|m| m.nick.clone())
                 .or_else(|| user.global_name.clone())
                 .unwrap_or_else(|| user.name.clone());
-            let (group, to) = group_at(&place, thread_of(&place), name, true);
+            let thread = match &stopped {
+                Some(to) => to.starts_with(&format!("{PREFIX}t")).then(|| ChannelPlace {
+                    id: to.clone(),
+                    title: None,
+                }),
+                None => thread_of(&place),
+            };
+            let (group, to) = group_at(&place, thread, name, true);
             (Some(group), to)
         }
     };
-    if group.is_none() {
+    // A Stop gets no reply of its own, so no typing shows.
+    if group.is_none() && stopped.is_none() {
         ctx.typing.start(&to);
     }
     send_inbound(
@@ -1322,7 +1346,18 @@ async fn havn_outbound_loop(
 ) -> Result<()> {
     let mut menu: Option<Vec<types::ChannelCommand>> = None;
     let mut replies = Replies::default();
-    while let Some(frame) = inbound_rx.recv().await {
+    let mut idle = tokio::time::interval(LIVE_IDLE_EVERY);
+    loop {
+        let frame = tokio::select! {
+            frame = inbound_rx.recv() => frame,
+            _ = idle.tick() => {
+                replies.idle(&dc).await;
+                continue;
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
         match frame {
             ChannelFrame::Commands(c) => {
                 GATEWAY_GROUPS.store(c.groups, Ordering::Relaxed);
@@ -1453,8 +1488,87 @@ async fn deliver(dc: &Discord, gateway: &Gateway, o: &ChannelOutbound) -> Result
 /// Discord lets a bot edit about five times in five seconds in a channel.
 const LIVE_EVERY: Duration = Duration::from_millis(1500);
 /// Replies being written that are kept at most; past that, the oldest is
-/// let go as it is (one whose end never came).
+/// finished as it is (one whose end never came).
 const LIVE_KEPT: usize = 256;
+/// A reply being written that gets nothing for this long is finished as
+/// it is, its Stop button taken off: the agent or the gateway went away
+/// before its end. `/stop` still stops it. As long as the typing indicator
+/// shows.
+const LIVE_IDLE: Duration = TYPING_FOR;
+/// How often replies being written are looked at for [`LIVE_IDLE`].
+const LIVE_IDLE_EVERY: Duration = Duration::from_secs(30);
+/// Replies that ended, remembered so a frame of one that comes late shows
+/// nothing.
+const ENDED_KEPT: usize = 256;
+/// How a Stop button names its reply: this and the reply's id.
+const STOP_PREFIX: &str = "stop#";
+
+/// The Stop button of a reply being written (havn issue #325): the
+/// conversation it stops, and whether it was pressed.
+struct Stop {
+    to: String,
+    pressed: bool,
+}
+
+/// The Stop buttons of the replies being written, by reply. A press of
+/// one whose reply is no longer written stops nothing.
+static STOPS: std::sync::LazyLock<Mutex<HashMap<String, Stop>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn stops() -> std::sync::MutexGuard<'static, HashMap<String, Stop>> {
+    STOPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a press of a button stops.
+#[derive(Debug, PartialEq, Eq)]
+enum Pressed {
+    /// It is not a Stop button.
+    Other,
+    /// A Stop button whose reply is no longer being written, or that was
+    /// pressed already: nothing.
+    Spent,
+    /// A Stop button: the conversation of its reply, which it stops once.
+    Stop(String),
+}
+
+/// What a press of button `data` stops.
+fn stop_of(data: &str) -> Pressed {
+    let Some(reply) = data.strip_prefix(STOP_PREFIX) else {
+        return Pressed::Other;
+    };
+    let mut stops = stops();
+    let Some(stop) = stops.get_mut(reply).filter(|s| !s.pressed) else {
+        return Pressed::Spent;
+    };
+    stop.pressed = true;
+    Pressed::Stop(stop.to.clone())
+}
+
+/// The buttons reply `reply` shows of `given`: the gateway's Stop button
+/// (`/stop`) naming the reply; none once it was pressed, or when the reply
+/// is not being written.
+fn live_buttons(reply: &str, given: &[Vec<types::Button>]) -> Vec<Vec<types::Button>> {
+    if stops().get(reply).is_none_or(|s| s.pressed) {
+        return Vec::new();
+    }
+    given
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|b| types::Button {
+                    label: b.label.clone(),
+                    data: if b.data == "/stop" {
+                        format!("{STOP_PREFIX}{reply}")
+                    } else {
+                        b.data.clone()
+                    },
+                })
+                .collect()
+        })
+        .collect()
+}
 
 /// One message of a reply being written: its id, its text, and whether it
 /// has the buttons.
@@ -1493,84 +1607,153 @@ fn changes(shown: &[Shown], parts: &[String], buttons: bool) -> Vec<Change> {
 /// The messages a reply being written is shown in (havn issue #325).
 #[derive(Debug)]
 struct Written {
+    /// The gateway's id of the reply.
+    reply: String,
     channel: Id<ChannelMarker>,
     /// What its first message answers.
-    reply: Option<Id<MessageMarker>>,
+    answers: Option<Id<MessageMarker>>,
     messages: Vec<Shown>,
-    /// What it was last given to show under its last message.
+    /// What the gateway last gave it to show under its last message.
     buttons: Vec<Vec<types::Button>>,
+    /// The thread its first message opened, to delete when it ends with
+    /// nothing to show.
+    opened: Option<Id<ChannelMarker>>,
 }
 
 impl Written {
-    fn new(channel: Id<ChannelMarker>, reply: Option<Id<MessageMarker>>) -> Self {
+    fn new(reply: &str, channel: Id<ChannelMarker>, answers: Option<Id<MessageMarker>>) -> Self {
         Self {
+            reply: reply.to_string(),
             channel,
-            reply,
+            answers,
             messages: Vec::new(),
             buttons: Vec::new(),
+            opened: None,
         }
     }
 
-    /// Show `text` in its messages, `buttons` under the last: those that
-    /// change are edited, those past them sent, those no longer needed
-    /// deleted. A message that cannot be changed is left as it was.
-    async fn show(&mut self, dc: &Discord, text: &str, buttons: &[Vec<types::Button>]) {
+    /// Show `text` in its messages, with its buttons under the last when
+    /// `with_buttons`: those that change are edited, those past them sent,
+    /// those no longer needed deleted. When `done` (the reply's part or
+    /// end), what cannot be put in its messages goes in new messages;
+    /// otherwise it waits for the next time.
+    async fn show(&mut self, dc: &Discord, text: &str, with_buttons: bool, done: bool) {
+        let buttons = if with_buttons {
+            live_buttons(&self.reply, &self.buttons)
+        } else {
+            Vec::new()
+        };
         let parts = text::split(text);
-        let rows = button_rows(buttons);
+        let rows = button_rows(&buttons);
+        if let Err(n) = self.put_all(dc, &parts, &rows).await
+            && done
+        {
+            self.fall_back(dc, &parts, &rows, n).await;
+        }
+    }
+
+    /// [`Self::show`] without its fallback: the first part that could not
+    /// be put, as the error.
+    async fn put_all(
+        &mut self,
+        dc: &Discord,
+        parts: &[String],
+        rows: &[Component],
+    ) -> Result<(), usize> {
         let under = !rows.is_empty();
-        for change in changes(&self.messages, &parts, under) {
-            match change {
+        for change in changes(&self.messages, parts, under) {
+            let n = match change {
                 Change::Delete(n) => {
                     dc.delete(self.channel, self.messages[n].id).await;
                     self.messages.truncate(n);
+                    continue;
                 }
-                Change::Edit(n) | Change::Send(n) => {
-                    let with = under && n + 1 == parts.len();
-                    let components: &[Component] = if with { &rows } else { &[] };
-                    let put = if let Some(old) = self.messages.get(n) {
-                        dc.edit_part(self.channel, old.id, &parts[n], components)
-                            .await
-                            .map(|()| old.id)
-                    } else {
-                        let reply = if n == 0 { self.reply } else { None };
-                        dc.send_part(self.channel, &parts[n], reply, components)
-                            .await
+                Change::Edit(n) | Change::Send(n) => n,
+            };
+            let with = under && n + 1 == parts.len();
+            let components: &[Component] = if with { rows } else { &[] };
+            let id = self.messages.get(n).map(|s| s.id);
+            match self.put(dc, id, n, &parts[n], components).await {
+                Ok(id) => {
+                    let shown = Shown {
+                        id,
+                        text: parts[n].clone(),
+                        buttons: with,
                     };
-                    match put {
-                        Ok(id) => {
-                            let shown = Shown {
-                                id,
-                                text: parts[n].clone(),
-                                buttons: with,
-                            };
-                            match self.messages.get_mut(n) {
-                                Some(old) => *old = shown,
-                                None => self.messages.push(shown),
-                            }
-                        }
-                        Err(e) if n < self.messages.len() => {
-                            debug!(error = %format!("{e:#}"), "discord: a reply being written could not be edited");
-                        }
-                        // The next ones would come out of order.
-                        Err(e) => {
-                            warn!(error = %format!("{e:#}"), "discord: a reply being written could not be sent");
-                            return;
-                        }
+                    match self.messages.get_mut(n) {
+                        Some(old) => *old = shown,
+                        None => self.messages.push(shown),
                     }
+                }
+                Err(e) => {
+                    debug!(error = %format!("{e:#}"), "discord: a reply being written could not be put");
+                    return Err(n);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `n`th of `parts` could not be put in its message: that message
+    /// and those after it go, and those parts go in new messages, as a
+    /// reply is sent.
+    async fn fall_back(&mut self, dc: &Discord, parts: &[String], rows: &[Component], n: usize) {
+        warn!(
+            "discord: a reply could not be shown in the messages it was being written in; sending the rest anew"
+        );
+        let gone: Vec<Shown> = self.messages.drain(n.min(self.messages.len())..).collect();
+        for old in gone.iter().rev() {
+            dc.delete(self.channel, old.id).await;
+        }
+        let under = !rows.is_empty();
+        for (k, part) in parts.iter().enumerate().skip(n) {
+            let with = under && k + 1 == parts.len();
+            let components: &[Component] = if with { rows } else { &[] };
+            match self.put(dc, None, k, part, components).await {
+                Ok(id) => self.messages.push(Shown {
+                    id,
+                    text: part.clone(),
+                    buttons: with,
+                }),
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "discord: a reply could not be sent");
+                    return;
                 }
             }
         }
     }
 
-    /// Take the buttons off its last message.
+    /// `part` in message `id`, or in a new message (the `n`th) when none:
+    /// its id.
+    async fn put(
+        &self,
+        dc: &Discord,
+        id: Option<Id<MessageMarker>>,
+        n: usize,
+        part: &str,
+        components: &[Component],
+    ) -> Result<Id<MessageMarker>> {
+        if let Some(id) = id {
+            return dc
+                .edit_part(self.channel, id, part, components)
+                .await
+                .map(|()| id);
+        }
+        let answers = if n == 0 { self.answers } else { None };
+        dc.send_part(self.channel, part, answers, components).await
+    }
+
+    /// Take the buttons off its last message; its text stays.
     async fn drop_buttons(&mut self, dc: &Discord) {
         if let Some(last) = self.messages.last_mut()
             && last.buttons
         {
-            if let Err(e) = dc.edit_part(self.channel, last.id, &last.text, &[]).await {
-                debug!(error = %format!("{e:#}"), "discord: the buttons could not be taken off");
+            match dc.edit_part(self.channel, last.id, &last.text, &[]).await {
+                Ok(()) => last.buttons = false,
+                Err(e) => {
+                    debug!(error = %format!("{e:#}"), "discord: the buttons could not be taken off");
+                }
             }
-            last.buttons = false;
         }
     }
 }
@@ -1587,8 +1770,8 @@ async fn write_live(
 ) -> Written {
     loop {
         let (text, buttons) = rx.borrow_and_update().clone();
-        written.buttons.clone_from(&buttons);
-        written.show(&dc, &text, &buttons).await;
+        written.buttons = buttons;
+        written.show(&dc, &text, true, false).await;
         let until = tokio::time::Instant::now() + LIVE_EVERY;
         if rx.changed().await.is_err() {
             return written;
@@ -1618,64 +1801,140 @@ enum Live {
     Part(Written),
 }
 
-/// The replies being written, by the gateway's id, oldest first.
+impl Live {
+    /// Its messages as they are, its task ended.
+    async fn written(self) -> Option<Written> {
+        match self {
+            Self::Writing { tx, task } => {
+                drop(tx);
+                task.await.ok()
+            }
+            Self::Part(part) => Some(part),
+        }
+    }
+}
+
+/// The replies being written, by the gateway's id, oldest first, with
+/// when each last got something; and those that ended lately.
 #[derive(Default)]
 struct Replies {
-    live: HashMap<String, Live>,
+    live: HashMap<String, (Live, tokio::time::Instant)>,
     order: VecDeque<String>,
+    ended: VecDeque<String>,
 }
 
 impl Replies {
-    fn put(&mut self, reply: String, live: Live) {
+    async fn put(&mut self, dc: &Discord, reply: String, live: Live) {
         self.order.retain(|r| *r != reply);
         self.order.push_back(reply.clone());
-        self.live.insert(reply, live);
+        self.live.insert(reply, (live, tokio::time::Instant::now()));
         while self.order.len() > LIVE_KEPT {
-            if let Some(oldest) = self.order.pop_front() {
-                self.live.remove(&oldest);
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((live, _)) = self.live.remove(&oldest) {
+                self.finish(dc, oldest, live).await;
             }
         }
     }
 
     fn take(&mut self, reply: &str) -> Option<Live> {
         self.order.retain(|r| r != reply);
-        self.live.remove(reply)
+        self.live.remove(reply).map(|(live, _)| live)
+    }
+
+    /// `reply` ended: its Stop button stops nothing, and a frame of it
+    /// that comes late shows nothing.
+    fn end(&mut self, reply: String) {
+        stops().remove(&reply);
+        self.ended.retain(|r| *r != reply);
+        self.ended.push_back(reply);
+        while self.ended.len() > ENDED_KEPT {
+            self.ended.pop_front();
+        }
+    }
+
+    /// Finish `reply` as it is shown: its buttons come off, its text stays.
+    async fn finish(&mut self, dc: &Discord, reply: String, live: Live) {
+        if let Some(mut written) = live.written().await {
+            written.drop_buttons(dc).await;
+        }
+        self.end(reply);
+    }
+
+    /// Finish the replies that got nothing for [`LIVE_IDLE`].
+    async fn idle(&mut self, dc: &Discord) {
+        let now = tokio::time::Instant::now();
+        let idle: Vec<String> = self
+            .live
+            .iter()
+            .filter(|(_, (_, seen))| now.duration_since(*seen) >= LIVE_IDLE)
+            .map(|(reply, _)| reply.clone())
+            .collect();
+        for reply in idle {
+            if let Some(live) = self.take(&reply) {
+                info!("discord: a reply being written got nothing for a while; finished as it is");
+                self.finish(dc, reply, live).await;
+            }
+        }
     }
 
     /// Show `w`: in its reply's messages, or in new ones (below a part of
     /// it shown, which loses its buttons), where its reply goes (a thread
-    /// waiting to be opened is opened).
+    /// waiting to be opened is opened); nothing for a reply that ended, or
+    /// that had nowhere to go.
     async fn writing(&mut self, dc: &Discord, w: types::ChannelWriting) {
+        if self.ended.contains(&w.reply) {
+            return;
+        }
         let showing = (w.text, w.buttons);
-        if let Some(Live::Writing { tx, .. }) = self.live.get(&w.reply) {
+        if let Some((Live::Writing { tx, .. }, seen)) = self.live.get_mut(&w.reply) {
             let _ = tx.send(showing);
+            *seen = tokio::time::Instant::now();
             return;
         }
         let written = if let Some(Live::Part(mut part)) = self.take(&w.reply) {
             part.drop_buttons(dc).await;
-            Written::new(part.channel, None)
+            Written::new(&w.reply, part.channel, None)
         } else {
             let answers = w.in_reply_to.as_deref().and_then(parse_message_id);
+            let waiting = match target_of(&w.to) {
+                Some(Target::Thread(t)) => WAITING_THREADS
+                    .lock()
+                    .ok()
+                    .is_some_and(|waiting| waiting.get(t.get()).is_some())
+                    .then_some(t),
+                _ => None,
+            };
             let channel = match reply_channel(dc, &w.to, answers).await {
                 Ok(channel) => channel,
                 Err(e) => {
                     warn!(error = %format!("{e:#}"), "discord: nowhere to show a reply being written");
+                    self.end(w.reply);
                     return;
                 }
             };
-            Written::new(
+            let mut written = Written::new(
+                &w.reply,
                 channel,
                 answers.and_then(|(c, m)| (c == channel).then_some(m)),
-            )
+            );
+            written.opened = waiting.filter(|t| *t == channel);
+            written
         };
+        stops().entry(w.reply.clone()).or_insert(Stop {
+            to: w.to,
+            pressed: false,
+        });
         let (tx, rx) = tokio::sync::watch::channel(showing);
         let task = tokio::spawn(write_live(dc.clone(), written, rx));
-        self.put(w.reply, Live::Writing { tx, task });
+        self.put(dc, w.reply, Live::Writing { tx, task }).await;
     }
 
     /// Show `o`, a part of a reply being written or its end, in that
     /// reply's messages: whether it was; one that is not, or whose reply
-    /// is not shown, goes as any other. The end takes the buttons off.
+    /// is not shown, goes as any other. The end takes the buttons off, and
+    /// one with nothing to show deletes the thread the reply opened.
     async fn reply(&mut self, dc: &Discord, o: &ChannelOutbound) -> bool {
         let (Some(reply), ChannelMessageContent::Text { text }) = (&o.reply, &o.content) else {
             return false;
@@ -1686,34 +1945,33 @@ impl Replies {
         let Some(live) = self.take(reply) else {
             return false;
         };
-        let mut written = match live {
-            Live::Writing { tx, task } => {
-                drop(tx);
-                match task.await {
-                    Ok(written) => written,
-                    Err(_) => return false,
-                }
-            }
+        let open = matches!(live, Live::Writing { .. });
+        let Some(mut written) = live.written().await else {
+            self.end(reply.clone());
+            return false;
+        };
+        if !open {
             // A part shown already: what follows goes below it.
-            Live::Part(mut part) => {
-                part.drop_buttons(dc).await;
-                if !o.partial {
-                    return false;
-                }
-                let mut below = Written::new(part.channel, None);
-                below.buttons = part.buttons;
-                below
+            written.drop_buttons(dc).await;
+            if !o.partial {
+                self.end(reply.clone());
+                return false;
             }
-        };
-        let buttons = if o.partial {
-            written.buttons.clone()
-        } else {
-            Vec::new()
-        };
-        written.show(dc, text, &buttons).await;
-        if o.partial {
-            self.put(reply.clone(), Live::Part(written));
+            let mut below = Written::new(reply, written.channel, None);
+            below.buttons = std::mem::take(&mut written.buttons);
+            written = below;
         }
+        written.show(dc, text, o.partial, true).await;
+        if o.partial {
+            self.put(dc, reply.clone(), Live::Part(written)).await;
+            return true;
+        }
+        if written.messages.is_empty()
+            && let Some(thread) = written.opened
+        {
+            dc.delete_thread(thread).await;
+        }
+        self.end(reply.clone());
         true
     }
 }
@@ -2048,6 +2306,41 @@ mod tests {
             changes(&[], &long, true),
             (0..long.len()).map(Change::Send).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_stop_button_stops_its_reply_conversation_once_and_only_while_it_is_written() {
+        let given = vec![vec![types::Button {
+            label: "Stop".into(),
+            data: "/stop".into(),
+        }]];
+        assert!(
+            live_buttons("d-before", &given).is_empty(),
+            "no reply written"
+        );
+        assert_eq!(stop_of("/approve r1"), Pressed::Other);
+        // A reply whose thread could not be opened went to its channel: the
+        // press stops the thread's conversation all the same.
+        stops().insert(
+            "d1".into(),
+            Stop {
+                to: "discord:t42".into(),
+                pressed: false,
+            },
+        );
+        let shown = live_buttons("d1", &given);
+        assert_eq!(shown[0][0].data, "stop#d1");
+        assert_eq!(stop_of("stop#d1"), Pressed::Stop("discord:t42".into()));
+        assert_eq!(stop_of("stop#d1"), Pressed::Spent, "once");
+        assert!(live_buttons("d1", &given).is_empty(), "not shown again");
+        let mut replies = Replies::default();
+        replies.end("d1".into());
+        assert_eq!(stop_of("stop#d1"), Pressed::Spent);
+        assert_eq!(stop_of("stop#d-unknown"), Pressed::Spent);
+        for n in 0..ENDED_KEPT + 5 {
+            replies.end(format!("e{n}"));
+        }
+        assert_eq!(replies.ended.len(), ENDED_KEPT);
     }
 
     #[test]

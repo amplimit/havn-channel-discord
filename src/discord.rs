@@ -252,6 +252,14 @@ impl Discord {
         Ok(())
     }
 
+    /// Delete thread `thread`, one the bot opened. Best-effort: Discord
+    /// lets a bot do it only with the Manage Threads permission.
+    pub async fn delete_thread(&self, thread: Id<ChannelMarker>) {
+        if let Err(e) = self.http.delete_channel(thread).await {
+            tracing::debug!(error = %e, "discord: a thread could not be deleted");
+        }
+    }
+
     /// Delete the bot's message `id`. Best-effort.
     pub async fn delete(&self, channel: Id<ChannelMarker>, id: Id<MessageMarker>) {
         if let Err(e) = self.http.delete_message(channel, id).await {
