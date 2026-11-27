@@ -2031,12 +2031,43 @@ impl Replies {
     /// takes the buttons off; one with nothing to show takes the bot's own
     /// messages of it down.
     async fn reply(&mut self, dc: &Discord, o: &ChannelOutbound) -> bool {
-        let (Some(reply), ChannelMessageContent::Text { text }) = (&o.reply, &o.content) else {
+        let Some(reply) = &o.reply else {
             return false;
         };
-        if !o.buttons.is_empty() || o.poll.is_some() {
-            return false;
-        }
+        let text = match &o.content {
+            ChannelMessageContent::Text { text } if o.buttons.is_empty() && o.poll.is_none() => {
+                text
+            }
+            // One with buttons or a question, or a file, goes as any reply:
+            // what was shown of its call is finished as it is (its Stop
+            // button goes, a message that only said the reply was being
+            // written goes), and the reply ends with it, or, after a part,
+            // goes on below it.
+            _ => {
+                let waited = self.unopened.remove(reply);
+                if let Some(live) = self.live.get_mut(reply) {
+                    live.seen = tokio::time::Instant::now();
+                    live.latest = None;
+                    if std::mem::take(&mut live.part) {
+                        live.written.drop_buttons(dc).await;
+                        live.written = live.written.below();
+                    } else if live.written.waiting {
+                        live.written.show(dc, "", false, true).await;
+                    } else {
+                        live.written.drop_buttons(dc).await;
+                    }
+                    live.written.waiting = false;
+                    if o.partial {
+                        live.part = true;
+                    } else {
+                        self.end(reply.clone());
+                    }
+                } else if waited && !o.partial {
+                    self.end(reply.clone());
+                }
+                return false;
+            }
+        };
         // One still waiting for text goes as any reply: it opens its thread
         // only when it has something to say.
         let waited = self.unopened.remove(reply);
@@ -2777,6 +2808,66 @@ mod tests {
         assert!(!unopened_thread("discord:t9902"), "opened, or never named");
         assert!(!unopened_thread("discord:c9901"), "a channel");
         assert!(!unopened_thread("discord:9901"), "a person");
+    }
+
+    #[tokio::test]
+    async fn a_reply_ending_on_a_file_or_buttons_is_ended_and_a_part_goes_below() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let dc = Discord::new(
+            Arc::new(twilight_http::Client::new("x".into())),
+            Id::new(1),
+            Id::new(2),
+        )
+        .expect("client");
+        let mut replies = Replies::new(Typing::new(|_| Box::pin(async {})));
+        let live = || {
+            let now = tokio::time::Instant::now();
+            Live {
+                written: Written::new("r9", Id::new(7), None),
+                latest: Some(("stale".into(), Vec::new(), false)),
+                next: now,
+                part: false,
+                seen: now,
+            }
+        };
+        let out = |content: ChannelMessageContent, partial: bool| ChannelOutbound {
+            seq: 1,
+            account_id: "dc".into(),
+            to: "discord:1".into(),
+            in_reply_to: None,
+            content,
+            buttons: Vec::new(),
+            poll: None,
+            partial,
+            reply: Some("r9".into()),
+        };
+        let file = || ChannelMessageContent::File {
+            url: "/api/v1/channel/files/a/b".into(),
+            filename: "a.pdf".into(),
+            caption: None,
+        };
+        replies.live.insert("r9".into(), live());
+        // A file as a part: delivered as any reply; the next call goes below.
+        assert!(!replies.reply(&dc, &out(file(), true)).await);
+        assert!(replies.live["r9"].part && replies.live["r9"].latest.is_none());
+        // A file as its end: the reply ends, its Stop button with it.
+        assert!(!replies.reply(&dc, &out(file(), false)).await);
+        assert!(replies.live.is_empty() && replies.ended.contains(&"r9".to_string()));
+        // An end with buttons ends it too.
+        replies.ended.clear();
+        replies.live.insert("r9".into(), live());
+        let mut asked = out(
+            ChannelMessageContent::Text {
+                text: "Which?".into(),
+            },
+            false,
+        );
+        asked.buttons = vec![vec![types::Button {
+            label: "Red".into(),
+            data: "/choose 1".into(),
+        }]];
+        assert!(!replies.reply(&dc, &asked).await);
+        assert!(replies.live.is_empty());
     }
 
     #[tokio::test]
